@@ -742,7 +742,7 @@ enum Vista { PRINCIPAL, TOKENS, DETALLE, GRABANDO, PROCESANDO, CONFIRMAR, AVISO 
 Vista vista = PRINCIPAL;
 String procesandoTxt = "Transcribiendo...", procesandoSub = "whisper en tu Mac";
 // Voz (definido más abajo)
-struct Pendiente { String id, texto, carpeta, destino; } pendiente;
+struct Pendiente { String id, texto, carpeta, destino; bool comando = false, sostener = false; } pendiente;
 String destinoSid, destinoNombre;   // grabación dirigida a una sesión abierta (vacío = sesión nueva)
 String avisoTxt;
 uint16_t avisoColor = 0;
@@ -834,7 +834,7 @@ void gesto(int x0, int y0, int dx, int dy) {
     if (y0 >= 320 && y0 <= 395 && x0 >= 90 && x0 < CX) {
       mostrarAviso("Cancelado", C_TENUE);
     } else if (y0 >= 320 && y0 <= 395 && x0 >= CX && x0 <= 376) {
-      lanzarPendiente();
+      if (!pendiente.sostener) lanzarPendiente();          // /clear y /exit: mantener (leerTouch)
     }
     return;
   }
@@ -918,6 +918,17 @@ void leerTouch() {
     // Aprobar un permiso: mantener 1 s sobre el botón (empezó dentro de él).
     static bool aprobado = false;
     if (millis() - tInicio < 30) aprobado = false;
+    // /clear y /exit: mantener Enviar 1 s.
+    if (vista == CONFIRMAR && pendiente.sostener && !aprobado && yi >= 320 && yi <= 395 && xi >= CX && xi <= 376) {
+      progresoAprobar = min(1.0f, (millis() - tInicio) / 1000.0f);
+      if (progresoAprobar >= 1.0f) {
+        aprobado = true;
+        progresoAprobar = 0;
+        xi = -1000;
+        lanzarPendiente();
+        return;
+      }
+    }
     int iDet = vista == DETALLE ? buscarDetalle() : -1;
     if (iDet >= 0 && estado.ses[iDet].estado == 'P' && estado.ses[iDet].espera.length() &&
         enBoton(xi, yi, BTN_AX) && !aprobado) {
@@ -1127,6 +1138,8 @@ void terminarGrabacion() {
     pendiente.texto = d["texto"] | "";
     pendiente.carpeta = d["carpeta"] | "";
     pendiente.destino = d["destino"] | "";
+    pendiente.comando = (d["comando"] | 0) == 1;
+    pendiente.sostener = (d["sostener"] | 0) == 1;
     confirmarDesde = millis();
     vista = CONFIRMAR;
   } else {
@@ -1179,13 +1192,26 @@ void dibujarConfirmar() {
   lienzo->setFont(u8g2_font_helvR10_tf);
   if (pendiente.destino.length()) centrado("Mensaje para " + recortar(pendiente.destino, 240), 88, C_CLAUDE);
   else centrado("Nueva sesión en " + recortar(pendiente.carpeta, 240), 88, C_TENUE);
-  lienzo->setFont(u8g2_font_helvB12_tf);
-  String renglones[6];
-  int n = envolver(pendiente.texto, 330, renglones, 6);
-  int y = 205 - (n - 1) * 11;
-  for (int i = 0; i < n; i++) centrado(renglones[i], y + i * 22, C_TINTA);
+  if (pendiente.comando) {   // comando de Claude Code: se muestra en grande, tal cual se teclea
+    lienzo->setFont(u8g2_font_helvB12_tf);
+    centrado("COMANDO", 165, C_PERMISO);
+    lienzo->setFont(u8g2_font_helvB24_tf);
+    centrado(pendiente.texto, 220, C_TINTA);
+  } else {
+    lienzo->setFont(u8g2_font_helvB12_tf);
+    String renglones[6];
+    int n = envolver(pendiente.texto, 330, renglones, 6);
+    int y = 205 - (n - 1) * 11;
+    for (int i = 0; i < n; i++) centrado(renglones[i], y + i * 22, C_TINTA);
+  }
   lienzo->fillRoundRect(95, 330, 128, 48, 24, C_FILA);
   lienzo->fillRoundRect(243, 330, 128, 48, 24, 0x2C66);
+  if (pendiente.sostener && progresoAprobar > 0)
+    lienzo->fillRoundRect(243, 330, max(48, (int)(128 * progresoAprobar)), 48, 24, C_VERDE);
+  if (pendiente.sostener) {
+    lienzo->setFont(u8g2_font_helvR08_tf);
+    centrado("mantén Enviar 1 s", 400, C_GRIS);
+  }
   lienzo->setFont(u8g2_font_helvB12_tf);
   lienzo->setTextColor(C_TENUE);
   lienzo->setCursor(159 - anchoTexto("Cancelar") / 2, 360);

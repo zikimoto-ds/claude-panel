@@ -866,6 +866,20 @@ class Manejador(BaseHTTPRequestHandler):
                 return "/dev/" + tty, s.get("nombre") or s.get("proyecto") or "sesión"
         raise RuntimeError("la sesión ya no está abierta")
 
+    def _verificar_destino(self, p):
+        """Al confirmar, revisa el estado actual: pudo cambiar desde que se dictó."""
+        if not p.get("sid"):
+            return
+        with lock:
+            estado = json.loads(cache_estado["json"])
+        s = next((x for x in estado.get("sesiones", []) if x.get("id") == p["sid"]), None)
+        if not s:
+            raise RuntimeError("la sesión ya no está abierta")
+        if s.get("estado") in ("permiso", "respuesta"):
+            raise RuntimeError("primero contesta el permiso o la pregunta de esa sesión")
+        if p.get("sostener") and s.get("estado") != "en_espera":
+            raise RuntimeError(p["texto"] + " solo con la sesión en espera (ahora está trabajando)")
+
     def _post_voz(self, ruta):
         try:
             cuerpo = self._leer_cuerpo(2_000_000)   # ~60 s de audio a 16 kHz mono
@@ -878,11 +892,11 @@ class Manejador(BaseHTTPRequestHandler):
                 destino = parse_qs(urlparse(self.path).query).get("s", [""])[0]
                 if destino:                        # mensaje para una sesión abierta en Terminal
                     tty, nombre = self._destino(destino)
-                    return self._json(200, voz.preparar_mensaje(voz.transcribir(cuerpo), tty, nombre))
+                    return self._json(200, voz.preparar_mensaje(voz.transcribir(cuerpo), tty, nombre, destino))
                 return self._json(200, voz.preparar(voz.transcribir(cuerpo)))
             datos = json.loads(cuerpo or b"{}")
             if ruta == "/api/voz/confirmar":       # placa: confirma la sesión pendiente
-                return self._json(200, voz.confirmar(str(datos.get("id", ""))))
+                return self._json(200, voz.confirmar(str(datos.get("id", "")), verificar=self._verificar_destino))
             if ruta == "/api/sesion":              # Atajo de Siri: texto ya revisado en el iPhone
                 texto = str(datos.get("texto", "")).strip()
                 if not texto:

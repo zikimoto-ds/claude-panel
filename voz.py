@@ -138,24 +138,57 @@ def preparar(texto):
     return {"id": ident, "texto": instruccion[:400], "carpeta": _ruta_corta(carpeta)}
 
 
-def preparar_mensaje(texto, tty, nombre):
-    """Mensaje pendiente de confirmar para una sesión que ya está abierta en Terminal."""
-    texto = _una_linea(texto)
+# Comandos de Claude Code que se pueden dictar: "comando <palabra>" exacto, sin argumentos.
+# sostener = en la placa hay que mantener Enviar 1 s, y solo con la sesión en espera.
+# Solo comandos que se ejecutan directo: los que abren un panel (/status, /cost, /model...)
+# dejan la sesión esperando un Esc que no se puede mandar desde aquí (probado con /status).
+COMANDOS = {
+    "compactar": ("/compact", False), "compacta": ("/compact", False),
+    "limpiar": ("/clear", True), "limpia": ("/clear", True),
+    "salir": ("/exit", True), "sal": ("/exit", True),
+}
+_PERMITIDOS = {v[0] for v in COMANDOS.values()}
+
+
+def comando_dictado(texto):
+    """'Comando compactar.' -> ('/compact', False). None si no empieza con "comando".
+    Si empieza con "comando" pero no está en la lista, error (nunca se adivina)."""
+    norm = _normalizar(texto)
+    if not re.match(r"^comando\b", norm):
+        return None
+    m = re.fullmatch(r"comando (\w+)", norm)
+    if not m or m.group(1) not in COMANDOS:
+        raise RuntimeError("comando no reconocido: " + norm[:40] + " (se puede: compactar, limpiar, salir)")
+    return COMANDOS[m.group(1)]
+
+
+def preparar_mensaje(texto, tty, nombre, sid=""):
+    """Mensaje (o comando de la lista) pendiente de confirmar para una sesión abierta en Terminal."""
+    cmd = comando_dictado(texto)
+    if cmd:
+        texto, sostener = cmd
+    else:
+        texto, sostener = _una_linea(texto), False
     if not texto:
         raise RuntimeError("mensaje vacío")
     ident = uuid.uuid4().hex[:12]
     with _lock:
-        _pendientes[ident] = {"tipo": "mensaje", "texto": texto, "tty": tty, "destino": nombre, "ts": time.time()}
-    return {"id": ident, "texto": texto[:400], "carpeta": "", "destino": nombre[:60]}
+        _pendientes[ident] = {"tipo": "mensaje", "texto": texto, "tty": tty, "destino": nombre, "sid": sid,
+                              "comando": bool(cmd), "sostener": sostener, "ts": time.time()}
+    return {"id": ident, "texto": texto[:400], "carpeta": "", "destino": nombre[:60],
+            "comando": 1 if cmd else 0, "sostener": 1 if sostener else 0}
 
 
-def confirmar(ident):
+def confirmar(ident, verificar=None):
+    """verificar(p): lo pasa el servidor para revisar el estado actual de la sesión destino."""
     with _lock:
         p = _pendientes.pop(ident, None)
     if not p or time.time() - p["ts"] > VIGENCIA_PENDIENTE:
         raise RuntimeError("la petición venció o no existe")
     if p.get("tipo") == "mensaje":
-        enviar_a_terminal(p["tty"], p["texto"])
+        if verificar:
+            verificar(p)
+        enviar_a_terminal(p["tty"], p["texto"], comando=p.get("comando", False))
         return {"ok": True, "destino": p["destino"][:60]}
     lanzar(p["texto"], p["carpeta"])
     return {"ok": True, "carpeta": _ruta_corta(p["carpeta"])}
@@ -191,8 +224,12 @@ end run
 """
 
 
-def enviar_a_terminal(tty, texto):
-    texto = _una_linea(texto)
+def enviar_a_terminal(tty, texto, comando=False):
+    if comando:
+        if texto not in _PERMITIDOS:     # solo los comandos exactos de la lista
+            raise RuntimeError("comando no permitido")
+    else:
+        texto = _una_linea(texto)
     if not re.fullmatch(r"/dev/ttys\d+", tty or ""):
         raise RuntimeError("terminal no válida")
     r = subprocess.run(["/usr/bin/osascript", "-e", _SCRIPT_TERMINAL, tty, texto],
