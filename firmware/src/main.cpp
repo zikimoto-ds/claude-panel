@@ -63,6 +63,7 @@ struct Sesion {
   String nombre, proyecto, herramienta, origen;
   String espera, resumen;  // permiso contestable: id y comando/archivo (vacío por el túnel)
   String sid;              // id de la sesión si acepta mensajes por voz (Claude en Terminal)
+  String clave;            // id estable de la sesión (los nombres se repiten)
   char estado;
   char agente;  // 'c' = Claude Code, 'x' = Codex
   long salida;
@@ -186,7 +187,8 @@ bool abrirStream() {
   String linea = clienteTls.readStringUntil('\n');
   int codigo = linea.length() > 12 ? linea.substring(9, 12).toInt() : 0;
   streamChunked = false;
-  while (clienteTls.connected()) {
+  uint32_t tCab = millis();
+  for (int nCab = 0; clienteTls.connected() && nCab < 40 && millis() - tCab < 10000; nCab++) {
     linea = clienteTls.readStringUntil('\n');
     linea.trim();
     if (linea.isEmpty()) break;
@@ -341,6 +343,7 @@ bool aplicar(JsonDocument &doc) {
     d.espera = s["q"] | "";
     d.resumen = s["r"] | "";
     d.sid = s["i"] | "";
+    d.clave = s["k"] | "";
   }
   estado.usem = doc["usem"] | 0L;
   estado.lsem = doc["lsem"] | 0L;
@@ -757,12 +760,12 @@ void iniciarGrabacion();
 void terminarGrabacion();
 void lanzarPendiente();
 void mostrarAviso(const String &txt, uint16_t color);
-String detalleClave;          // nombre + proyecto de la sesión abierta en detalle
+String detalleClave;          // id estable (k) de la sesión abierta en detalle
 uint32_t ultimoToque = 0;
 
 int buscarDetalle() {
   for (int i = 0; i < estado.nses; i++)
-    if (estado.ses[i].nombre + "|" + estado.ses[i].proyecto == detalleClave) return i;
+    if (estado.ses[i].clave == detalleClave) return i;
   return -1;
 }
 
@@ -860,7 +863,7 @@ void gesto(int x0, int y0, int dx, int dy) {
   // Toque sobre un muñequito: detalle de esa sesión
   int i = sesionEn(x0, y0);
   if (i >= 0) {
-    detalleClave = estado.ses[i].nombre + "|" + estado.ses[i].proyecto;
+    detalleClave = estado.ses[i].clave;
     vista = DETALLE;
   }
 }
@@ -907,11 +910,14 @@ void leerTouch() {
   // tras 150 ms sin lecturas (si no, una presión larga se parte en muchos toques cortos).
   if (n) tUltimoPunto = millis();
   if (n) {
+    static String objetivoInicio;   // permiso o pendiente al que apuntaba el dedo al empezar
     if (!tocando) {
       tocando = true;
       tInicio = millis();
       xi = x[0];
       yi = y[0];
+      int iIni = vista == DETALLE ? buscarDetalle() : -1;
+      objetivoInicio = vista == CONFIRMAR ? pendiente.id : (iIni >= 0 ? estado.ses[iIni].espera : String(""));
     }
     xu = x[0];
     yu = y[0];
@@ -919,7 +925,8 @@ void leerTouch() {
     static bool aprobado = false;
     if (millis() - tInicio < 30) aprobado = false;
     // /clear y /exit: mantener Enviar 1 s.
-    if (vista == CONFIRMAR && pendiente.sostener && !aprobado && yi >= 320 && yi <= 395 && xi >= CX && xi <= 376) {
+    if (vista == CONFIRMAR && pendiente.sostener && !aprobado && pendiente.id == objetivoInicio &&
+        yi >= 320 && yi <= 395 && xi >= CX && xi <= 376) {
       progresoAprobar = min(1.0f, (millis() - tInicio) / 1000.0f);
       if (progresoAprobar >= 1.0f) {
         aprobado = true;
@@ -931,7 +938,7 @@ void leerTouch() {
     }
     int iDet = vista == DETALLE ? buscarDetalle() : -1;
     if (iDet >= 0 && estado.ses[iDet].estado == 'P' && estado.ses[iDet].espera.length() &&
-        enBoton(xi, yi, BTN_AX) && !aprobado) {
+        estado.ses[iDet].espera == objetivoInicio && enBoton(xi, yi, BTN_AX) && !aprobado) {
       progresoAprobar = min(1.0f, (millis() - tInicio) / 1000.0f);
       if (progresoAprobar >= 1.0f) {
         aprobado = true;

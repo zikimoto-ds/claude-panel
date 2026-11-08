@@ -123,6 +123,15 @@ def _sin_opciones(texto):
     return texto.lstrip("-\u2013\u2014 \t\r\n")
 
 
+def _purgar():
+    """Quita pendientes vencidos y deja como máximo 20 (llamar con _lock tomado)."""
+    ahora = time.time()
+    for k in [k for k, v in _pendientes.items() if ahora - v["ts"] > VIGENCIA_PENDIENTE]:
+        _pendientes.pop(k)
+    while len(_pendientes) >= 20:
+        _pendientes.pop(min(_pendientes, key=lambda k: _pendientes[k]["ts"]))
+
+
 def preparar(texto):
     """Registra una sesión pendiente de confirmar. Devuelve el dict que se manda a la placa."""
     carpeta, instruccion = separar_carpeta(texto)
@@ -131,10 +140,8 @@ def preparar(texto):
         raise RuntimeError("instrucción vacía")
     ident = uuid.uuid4().hex[:12]
     with _lock:
-        ahora = time.time()
-        for k in [k for k, v in _pendientes.items() if ahora - v["ts"] > VIGENCIA_PENDIENTE]:
-            _pendientes.pop(k)
-        _pendientes[ident] = {"texto": instruccion, "carpeta": carpeta, "ts": ahora}
+        _purgar()
+        _pendientes[ident] = {"texto": instruccion, "carpeta": carpeta, "ts": time.time()}
     return {"id": ident, "texto": instruccion[:400], "carpeta": _ruta_corta(carpeta)}
 
 
@@ -154,12 +161,10 @@ def comando_dictado(texto):
     """'Comando compactar.' -> ('/compact', False). None si no empieza con "comando".
     Si empieza con "comando" pero no está en la lista, error (nunca se adivina)."""
     norm = _normalizar(texto)
-    if not re.match(r"^comando\b", norm):
-        return None
     m = re.fullmatch(r"comando (\w+)", norm)
-    if not m or m.group(1) not in COMANDOS:
-        raise RuntimeError("comando no reconocido: " + norm[:40] + " (se puede: compactar, limpiar, salir)")
-    return COMANDOS[m.group(1)]
+    if m and m.group(1) in COMANDOS:
+        return COMANDOS[m.group(1)]
+    return None   # cualquier otra cosa es un mensaje normal ("comando de git falló…")
 
 
 def preparar_mensaje(texto, tty, nombre, sid=""):
@@ -173,6 +178,7 @@ def preparar_mensaje(texto, tty, nombre, sid=""):
         raise RuntimeError("mensaje vacío")
     ident = uuid.uuid4().hex[:12]
     with _lock:
+        _purgar()
         _pendientes[ident] = {"tipo": "mensaje", "texto": texto, "tty": tty, "destino": nombre, "sid": sid,
                               "comando": bool(cmd), "sostener": sostener, "ts": time.time()}
     return {"id": ident, "texto": texto[:400], "carpeta": "", "destino": nombre[:60],

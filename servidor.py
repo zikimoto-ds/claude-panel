@@ -104,6 +104,7 @@ VENTANA_5H = 5 * 3600
 RETENCION = 8 * 24 * 3600   # alcanza para la semana completa
 
 lock = threading.Lock()
+TRANSCRIBIENDO = threading.Lock()   # whisper usa 6 hilos: una transcripción a la vez
 
 
 # ---------------------------------------------------------------- tokens ----
@@ -119,15 +120,21 @@ class ContadorTokens:
         self.por_sesion = {}       # session_id -> dict de totales
         self.titulos = {}          # session_id -> {"custom": str, "ai": str} (el último visto de cada tipo)
 
+    _recientes = (0.0, set())   # (cuándo se listó, rutas modificadas en la retención)
+
     def _archivos(self, ids_activos):
         corte = time.time() - RETENCION
-        rutas = set()
-        for ruta in glob.glob(str(PROJECTS_DIR / "**" / "*.jsonl"), recursive=True):
-            try:
-                if os.path.getmtime(ruta) >= corte:
-                    rutas.add(ruta)
-            except OSError:
-                pass
+        t, recientes = self._recientes
+        if time.time() - t > 30:   # el glob recursivo es caro: cada 30 s; lo activo se agrega abajo
+            recientes = set()
+            for ruta in glob.glob(str(PROJECTS_DIR / "**" / "*.jsonl"), recursive=True):
+                try:
+                    if os.path.getmtime(ruta) >= corte:
+                        recientes.add(ruta)
+                except OSError:
+                    pass
+            self._recientes = (time.time(), recientes)
+        rutas = set(recientes)
         for sid in ids_activos:
             rutas.update(glob.glob(str(PROJECTS_DIR / "*" / f"{sid}.jsonl")))
         return rutas
@@ -286,12 +293,14 @@ def _ts(valor):
 # -------------------------------------------------------------- sesiones ----
 
 def _vivo(pid):
+    if not isinstance(pid, int) or not 0 < pid < 10_000_000:
+        return False
     try:
         os.kill(pid, 0)
         return True
     except PermissionError:
         return True
-    except (OSError, ValueError):
+    except (OSError, ValueError, OverflowError):
         return False
 
 
@@ -397,7 +406,7 @@ class SesionesCodex:
             return
         s = self.ses.setdefault(sid, {"cwd": "", "pid": 0, "estado": "en_espera", "inicio": ahora})
         s["cwd"] = str(d.get("cwd") or s["cwd"])
-        if pid > 1:
+        if 1 < pid < 10_000_000:
             s["pid"] = pid
         s["cambio"] = ahora
         s["evento"] = evento
@@ -501,6 +510,19 @@ class SesionesCodex:
                 item["permiso_mensaje"] = "permission to use " + s.get("herramienta", "")
             salida.append(item)
         return salida
+
+
+def _es_interactiva(sid):
+    """La sesión está en el registro como interactiva (CLI o app de escritorio)."""
+    for ruta in glob.glob(str(SESSIONS_DIR / "*.json")):
+        try:
+            with open(ruta) as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if d.get("sessionId") == sid:
+            return d.get("kind", "interactive") == "interactive" and _vivo(d.get("pid"))
+    return False
 
 
 def resumen_permiso(tool, entrada):
@@ -609,6 +631,7 @@ def resumen_placa(estado):
              "og": s["origen"][:10],
              "min": round((time.time() - s["inicio"]) / 60) if s["inicio"] else 0,
              "a": "x" if s.get("agente") == "codex" else "c",   # c = Claude, x = Codex
+             "k": hashlib.sha256(str(s["id"]).encode()).hexdigest()[:10],   # id estable (los nombres se repiten)
              "i": s["id"] if s.get("agente") != "codex" and s.get("origen") == "cli" else "",   # acepta mensajes por voz
              "q": s.get("espera_id", ""),                       # permiso contestable desde la placa
              "r": s.get("espera_resumen", "")[:140]}
@@ -701,6 +724,8 @@ def bucle():
 # ------------------------------------------------------------------ HTTP ----
 
 class Manejador(BaseHTTPRequestHandler):
+    timeout = 30   # s por operación de socket (lectura o escritura)
+
     def log_message(self, *a):
         pass
 
@@ -791,7 +816,8 @@ class Manejador(BaseHTTPRequestHandler):
             if not self._autorizado(qs):
                 return self._enviar(401, b'{"error":"token"}')
             with lock:
-                self._enviar(200, self._cache("placa"))
+                cuerpo = self._cache("placa")
+            self._enviar(200, cuerpo)
         elif u.path == "/api/placa/stream":
             if not self._autorizado(qs):
                 return self._enviar(401, b'{"error":"token"}')
@@ -800,7 +826,8 @@ class Manejador(BaseHTTPRequestHandler):
             if not self._autorizado(qs):
                 return self._enviar(401, b'{"error":"token"}')
             with lock:
-                self._enviar(200, self._cache("json"))
+                cuerpo = self._cache("json")
+            self._enviar(200, cuerpo)
         else:
             self._enviar(404, b'{"error":"no existe"}')
 
@@ -836,9 +863,12 @@ class Manejador(BaseHTTPRequestHandler):
             pass  # la placa se desconectó
 
     def _leer_cuerpo(self, maximo):
-        n = int(self.headers.get("Content-Length") or 0)
-        if n > maximo:
-            raise ValueError("cuerpo demasiado grande")
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise ValueError("Content-Length inválido")
+        if n < 0 or n > maximo:
+            raise ValueError("cuerpo demasiado grande o longitud inválida")
         return self.rfile.read(n) if n else b""
 
     def _json(self, codigo, datos):
@@ -877,6 +907,13 @@ class Manejador(BaseHTTPRequestHandler):
             raise RuntimeError("la sesión ya no está abierta")
         if s.get("estado") in ("permiso", "respuesta"):
             raise RuntimeError("primero contesta el permiso o la pregunta de esa sesión")
+        try:
+            r = subprocess.run(["/bin/ps", "-o", "tty=", "-p", str(int(s["pid"]))], capture_output=True, text=True, timeout=3)
+            tty_actual = "/dev/" + r.stdout.strip()
+        except (OSError, subprocess.SubprocessError, ValueError):
+            tty_actual = ""
+        if tty_actual != p.get("tty"):
+            raise RuntimeError("la terminal de esa sesión cambió; vuelve a dictar")
         if p.get("sostener") and s.get("estado") != "en_espera":
             raise RuntimeError(p["texto"] + " solo con la sesión en espera (ahora está trabajando)")
 
@@ -889,11 +926,17 @@ class Manejador(BaseHTTPRequestHandler):
             return self._json(401, {"error": "firma"})
         try:
             if ruta == "/api/voz":                 # placa: audio PCM -> texto pendiente de confirmar
+                if not TRANSCRIBIENDO.acquire(blocking=False):
+                    return self._json(429, {"error": "ya hay una transcripción en curso"})
+                try:
+                    texto = voz.transcribir(cuerpo)
+                finally:
+                    TRANSCRIBIENDO.release()
                 destino = parse_qs(urlparse(self.path).query).get("s", [""])[0]
                 if destino:                        # mensaje para una sesión abierta en Terminal
                     tty, nombre = self._destino(destino)
-                    return self._json(200, voz.preparar_mensaje(voz.transcribir(cuerpo), tty, nombre, destino))
-                return self._json(200, voz.preparar(voz.transcribir(cuerpo)))
+                    return self._json(200, voz.preparar_mensaje(texto, tty, nombre, destino))
+                return self._json(200, voz.preparar(texto))
             datos = json.loads(cuerpo or b"{}")
             if ruta == "/api/voz/confirmar":       # placa: confirma la sesión pendiente
                 return self._json(200, voz.confirmar(str(datos.get("id", "")), verificar=self._verificar_destino))
@@ -920,6 +963,8 @@ class Manejador(BaseHTTPRequestHandler):
         herr = str(d.get("tool_name", ""))[:24]
         resumen = resumen_permiso(herr, d.get("tool_input"))
         es_codex = qs.get("src", [""])[0] == "codex"
+        if not es_codex and not _es_interactiva(sid):
+            return self._enviar(204, b"")   # -p / SDK: nadie mira la placa; no frenar la corrida
         with lock:
             if es_codex:
                 try:
@@ -937,24 +982,27 @@ class Manejador(BaseHTTPRequestHandler):
         inicio = time.time()
         try:
             while not e["evento"].wait(1):
-                if time.time() - inicio > ESPERA_PERMISO_MAX:
-                    break
-                with lock:   # ¿se contestó en la Mac? (la sesión siguió y ya no pide permiso)
+                with lock:   # ¿se contestó en la Mac o venció? Revisar y retirar juntos, bajo el lock,
+                    # para que una decisión de la placa no llegue entre ambos pasos.
                     sigue = (codex.ses.get(sid, {}).get("estado") == "permiso") if es_codex else (sid in hooks.permiso)
-                if not sigue:
-                    break
+                    if not sigue or time.time() - inicio > ESPERA_PERMISO_MAX:
+                        if e["decision"] is None:
+                            esperas.d.pop(ident, None)
+                            break
         finally:
             with lock:
                 esperas.d.pop(ident, None)
+                otra, _ = esperas.de_sesion(sid)   # ¿llegó otro permiso de la misma sesión mientras tanto?
         if e["decision"] is None:
             return self._enviar(204, b"")
         decision = {"behavior": "allow"} if e["decision"] == "a" else \
             {"behavior": "deny", "message": "Rechazado desde el panel físico."}
-        with lock:   # la placa ya contestó: quitar el aviso sin esperar al siguiente hook
-            if es_codex and sid in codex.ses:
-                codex.ses[sid]["estado"] = "trabajando" if e["decision"] == "a" else "en_espera"
-            else:
-                hooks.permiso.pop(sid, None)
+        with lock:   # la placa ya contestó: quitar el aviso (salvo que ya haya otro permiso pendiente)
+            if otra is None:
+                if es_codex and sid in codex.ses:
+                    codex.ses[sid]["estado"] = "trabajando" if e["decision"] == "a" else "en_espera"
+                else:
+                    hooks.permiso.pop(sid, None)
         print(f"permiso: {'aprobado' if e['decision'] == 'a' else 'rechazado'} desde la placa ({herr})", flush=True)
         cuerpo = json.dumps({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": decision}})
         self._enviar(200, cuerpo.encode())
@@ -999,8 +1047,10 @@ class Manejador(BaseHTTPRequestHandler):
         # Los hooks solo se aceptan desde la propia Mac (nunca por el túnel).
         if not self._es_local():
             return self._enviar(403, b'{"error":"solo local"}')
-        n = int(self.headers.get("Content-Length") or 0)
-        crudo = self.rfile.read(n) if n else b""
+        try:
+            crudo = self._leer_cuerpo(8_000_000)   # PostToolUse trae la salida completa de la herramienta
+        except ValueError:
+            return self._enviar(413, b'{"error":"cuerpo"}')
         try:
             d = json.loads(crudo or b"{}")
         except ValueError:
