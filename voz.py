@@ -170,7 +170,7 @@ def comando_dictado(texto, agente="claude"):
     return None   # cualquier otra cosa es un mensaje normal ("comando de git falló…")
 
 
-def preparar_mensaje(texto, tty, nombre, sid="", agente="claude"):
+def preparar_mensaje(texto, tty, nombre, sid="", agente="claude", pid=0):
     """Mensaje (o comando de la lista) pendiente de confirmar para una sesión abierta en Terminal."""
     cmd = comando_dictado(texto, agente)
     if cmd:
@@ -183,7 +183,7 @@ def preparar_mensaje(texto, tty, nombre, sid="", agente="claude"):
     with _lock:
         _purgar()
         _pendientes[ident] = {"tipo": "mensaje", "texto": texto, "tty": tty, "destino": nombre, "sid": sid,
-                              "comando": bool(cmd), "sostener": sostener, "agente": agente, "ts": time.time()}
+                              "comando": bool(cmd), "sostener": sostener, "agente": agente, "pid": pid, "ts": time.time()}
     return {"id": ident, "texto": texto[:400], "carpeta": "", "destino": nombre[:60],
             "comando": 1 if cmd else 0, "sostener": 1 if sostener else 0}
 

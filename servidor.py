@@ -408,7 +408,7 @@ class SesionesCodex:
         s["cwd"] = str(d.get("cwd") or s["cwd"])
         if 1 < pid < 10_000_000 and pid != s.get("pid"):
             s["pid"] = pid
-            s["plugin"] = _de_plugin(pid)
+            s["plugin"] = _de_plugin(pid)   # usa la instantánea: no lanza procesos con el lock tomado
         if evento == "Stop" and s.get("plugin"):
             # Consulta que hizo Claude con el plugin de Codex: terminó su tarea, ya no se muestra.
             self.ses.pop(sid, None)
@@ -449,106 +449,63 @@ class SesionesCodex:
             return
         self._titulos = titulos
 
-    _ps_cache = (0.0, [])
-
-    @classmethod
-    def _procesos(cls):
-        """Líneas 'pid comando' de ps, en caché 3 s."""
-        t, lineas = cls._ps_cache
-        if time.time() - t > 3:
-            try:
-                r = subprocess.run(["/bin/ps", "-ax", "-o", "pid=,command="], capture_output=True, text=True, timeout=3)
-                lineas = r.stdout.splitlines()
-            except (OSError, subprocess.SubprocessError):
-                lineas = []
-            cls._ps_cache = (time.time(), lineas)
-        return lineas
-
-    _tuis_cache = (0.0, {})
-
-    @classmethod
-    def _tuis(cls):
-        """carpeta -> {tty} de los Codex abiertos en una terminal (no app-server), en caché 3 s."""
-        t, mapa = cls._tuis_cache
-        if time.time() - t <= 3:
-            return mapa
-        mapa, ttys = {}, {}
-        try:
-            r = subprocess.run(["/bin/ps", "-ax", "-o", "pid=,tty=,command="], capture_output=True, text=True, timeout=3)
-            for l in r.stdout.splitlines():
-                partes = l.split(None, 2)
-                if len(partes) < 3 or partes[1] == "??":
-                    continue
-                c = partes[2]
-                if "app-server" in c or "code-mode-host" in c or "/.claude/plugins/" in c:
-                    continue
-                exe = (c.split() + ["", ""])[1] if c.startswith("node ") else c.split()[0]
-                if exe.endswith("/codex"):
-                    ttys[partes[0]] = "/dev/" + partes[1]
-            if ttys:
-                r = subprocess.run(["/usr/sbin/lsof", "-a", "-d", "cwd", "-Fn", "-p", ",".join(ttys)],
-                                   capture_output=True, text=True, timeout=5)
-                actual = None
-                for l in r.stdout.splitlines():
-                    if l.startswith("p"):
-                        actual = l[1:]
-                    elif l.startswith("n") and actual in ttys:
-                        mapa.setdefault(l[1:].rstrip("/"), set()).add(ttys[actual])
-        except (OSError, subprocess.SubprocessError):
-            pass
-        cls._tuis_cache = (time.time(), mapa)
-        return mapa
-
     def _viva(self, s):
         """Los hooks de las sesiones de terminal los corre el daemon de Codex (--managed-daemon), que
         sigue vivo al cerrar la ventana: para esas, la sesión vive mientras haya un Codex de terminal
-        abierto en su misma carpeta."""
+        abierto en su misma carpeta. Usa la instantánea de `inventario` (no lanza procesos)."""
         pid = s.get("pid") or 0
         if not pid:
             return True
         if not _vivo(pid):
             return False
-        lineas = self._procesos()
-        cmd = next((l.split(None, 1)[1] for l in lineas if l.split(None, 1)[0] == str(pid) and " " in l.strip()), "")
-        if "--managed-daemon" not in cmd:
+        proc = inventario.proc.get(pid)
+        if not proc or "--managed-daemon" not in proc["args"]:
             return True
-        return s.get("cwd", "").rstrip("/") in self._tuis()
+        if not inventario.ok:          # inventario incompleto: no borrar por una consulta fallida
+            return True
+        return _carpeta_real(s) in inventario.tuis
 
     def tty_de(self, sid):
-        """tty de la terminal de una sesión de Codex, si hay exactamente un Codex en su carpeta."""
+        """(tty, pid) de la terminal de una sesión de Codex, solo si no hay ambigüedad: un único Codex
+        de terminal en su carpeta, en primer plano, y una única sesión de Codex con esa carpeta."""
         s = self.ses.get(sid)
-        if not s:
+        if not s or s.get("plugin"):
             return None
-        ttys = self._tuis().get(s.get("cwd", "").rstrip("/"), set())
-        return next(iter(ttys)) if len(ttys) == 1 else None
+        carpeta = _carpeta_real(s)
+        tuis = inventario.tuis.get(carpeta, {})
+        if len(tuis) != 1:
+            return None
+        if sum(1 for x in self.ses.values() if not x.get("plugin") and _carpeta_real(x) == carpeta) != 1:
+            return None
+        tty, (pid, primer_plano) = next(iter(tuis.items()))
+        return (tty, pid) if primer_plano else None
 
     def lista(self):
         """Sesiones vivas con la misma forma que leer_registro()."""
         ahora = time.time()
         self._cargar_titulos()
-        for s in self.ses.values():   # sesiones guardadas antes de conocer su origen
-            if "plugin" not in s and s.get("pid"):
+        for s in self.ses.values():   # origen aún no conocido (proceso nuevo para la instantánea)
+            if s.get("plugin") is None and s.get("pid"):
                 s["plugin"] = _de_plugin(s["pid"])
         muertas = [k for k, s in self.ses.items()
                    if not self._viva(s) or ahora - s.get("cambio", 0) > CODEX_INACTIVA_MAX
-                   or (s.get("plugin") and s.get("estado") == "en_espera")]   # consulta mía ya terminada
+                   or (s.get("plugin") and s.get("evento") == "Stop")]   # consulta mía ya terminada
         for k in muertas:
             self.ses.pop(k)
         if muertas:
             self._guardar()
         salida = []
         for sid, s in self.ses.items():
-            estado_vis = s["estado"]
             item = {
                 "id": sid, "pid": s.get("pid", 0),
                 "nombre": self._titulos.get(sid, ""),
                 "proyecto": os.path.basename(s.get("cwd", "").rstrip("/")) or "~",
                 "origen": "codex", "agente": "codex",
-                "estado": estado_vis,
+                "estado": s["estado"],
                 "inicio": s.get("inicio", 0), "cambio_estado": s.get("cambio", 0),
                 "tokens": {"entrada": 0, "cache_escritura": 0, "cache_lectura": 0, "salida": 0},
                 "ultimo_hook": {"evento": s.get("evento", ""), "hace_seg": round(ahora - s.get("cambio", ahora))},
-                "tty_unico": not s.get("plugin") and self.tty_de(sid) is not None,   # acepta mensajes por voz
+                "tty_unico": self.tty_de(sid) is not None,   # acepta mensajes por voz
             }
             if s["estado"] == "permiso":
                 item["esperando_seg"] = round(ahora - s.get("desde", ahora))
@@ -557,22 +514,117 @@ class SesionesCodex:
         return salida
 
 
-def _de_plugin(pid):
-    """El proceso viene del plugin de Codex de Claude (app-server-broker): es una consulta mía."""
-    for _ in range(6):
+def _carpeta_real(s):
+    """Carpeta física de una sesión (lsof reporta rutas reales: /tmp -> /private/tmp, enlaces)."""
+    if "cwd_real" not in s or s.get("_cwd_de") != s.get("cwd"):
+        s["cwd_real"] = os.path.realpath(s.get("cwd") or "/") if s.get("cwd") else ""
+        s["_cwd_de"] = s.get("cwd")
+    return s["cwd_real"]
+
+
+def _primer_arg(proc):
+    """Primer argumento después del ejecutable (p. ej. 'app-server', 'exec', o el script de node)."""
+    args, exe = proc["args"], proc["exe"]
+    resto = args[len(exe):] if args.startswith(exe) else (args.split(None, 1) + ["", ""])[1]
+    return (resto.split() + [""])[0]
+
+
+class Inventario:
+    """Instantánea de procesos (ps + lsof). Se arma FUERA del lock global (puede tardar segundos)
+    y solo se publica bajo el lock; si una consulta falla se conserva la anterior."""
+
+    def __init__(self):
+        self.t = 0.0
+        self.ok = False
+        self.proc = {}   # pid -> {"ppid", "tty", "stat", "exe", "args"}
+        self.tuis = {}   # carpeta real -> {tty: (pid, en_primer_plano)} de Codex abiertos en terminal
+
+    def refrescar(self, max_edad=3.0):
+        """Llamar SIN el lock tomado."""
+        if time.time() - self.t < max_edad:
+            return
+        nuevo = self._leer()
+        with lock:
+            self.t = time.time()
+            if nuevo is not None:
+                self.proc, self.tuis, self.ok = nuevo[0], nuevo[1], True
+
+    @staticmethod
+    def _leer():
         try:
-            r = subprocess.run(["/bin/ps", "-o", "ppid=,command=", "-p", str(pid)], capture_output=True, text=True, timeout=3)
+            r1 = subprocess.run(["/bin/ps", "-ax", "-o", "pid=,ppid=,tty=,stat=,comm="],
+                                capture_output=True, text=True, timeout=3)
+            r2 = subprocess.run(["/bin/ps", "-ax", "-o", "pid=,args="], capture_output=True, text=True, timeout=3)
         except (OSError, subprocess.SubprocessError):
-            return False
-        partes = r.stdout.strip().split(None, 1)
-        if len(partes) < 2:
-            return False
-        if "app-server-broker" in partes[1] or "/.claude/plugins/" in partes[1]:
+            return None
+        if r1.returncode != 0 or not r1.stdout.strip():
+            return None
+        args = {}
+        for l in r2.stdout.splitlines():
+            partes = l.split(None, 1)
+            if partes and partes[0].isdigit():
+                args[int(partes[0])] = partes[1] if len(partes) > 1 else ""
+        proc = {}
+        for l in r1.stdout.splitlines():
+            partes = l.split(None, 4)    # el ejecutable (comm) puede traer espacios: va al final
+            if len(partes) < 5 or not partes[0].isdigit() or not partes[1].isdigit():
+                continue
+            pid = int(partes[0])
+            proc[pid] = {"ppid": int(partes[1]), "tty": partes[2], "stat": partes[3],
+                         "exe": partes[4], "args": args.get(pid, "")}
+        # Codex de terminal: ejecutable llamado `codex`, con tty, y que no sea servidor ni `exec`.
+        candidatos = {pid: p for pid, p in proc.items()
+                      if os.path.basename(p["exe"]) == "codex" and p["tty"] not in ("??", "-")
+                      and _primer_arg(p) not in ("app-server", "exec", "e", "mcp-server", "mcp")}
+        tuis = {}
+        if candidatos:
+            try:
+                r = subprocess.run(["/usr/sbin/lsof", "-a", "-d", "cwd", "-Fn", "-p", ",".join(map(str, candidatos))],
+                                   capture_output=True, text=True, timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                return None
+            actual = None
+            for l in r.stdout.splitlines():
+                if l.startswith("p") and l[1:].isdigit():
+                    actual = int(l[1:])
+                elif l.startswith("n") and actual in candidatos:
+                    p = candidatos[actual]
+                    # "+" = grupo en primer plano de su terminal; "T" = suspendido (Ctrl-Z)
+                    primer_plano = "+" in p["stat"] and "T" not in p["stat"]
+                    tuis.setdefault(os.path.realpath(l[1:]), {})["/dev/" + p["tty"]] = (actual, primer_plano)
+            if not tuis:                 # había Codex abiertos pero lsof no dio carpetas: consulta fallida
+                return None
+        return proc, tuis
+
+
+inventario = Inventario()
+
+
+def _de_plugin(pid):
+    """El proceso viene del plugin de Codex de Claude: algún ancestro es `node` corriendo el script
+    app-server-broker.mjs de ~/.claude/plugins/ (se mira el ejecutable y su script, no el prompt).
+    None si el proceso aún no está en la instantánea."""
+    for _ in range(8):
+        p = inventario.proc.get(pid)
+        if not p:
+            return None if pid > 1 else False
+        script = _primer_arg(p)
+        if os.path.basename(p["exe"]) == "node" and "/.claude/plugins/" in script and script.endswith("app-server-broker.mjs"):
             return True
-        pid = int(partes[0])
-        if pid <= 1:
+        if p["ppid"] <= 1:
             return False
+        pid = p["ppid"]
     return False
+
+
+def _en_primer_plano(pid):
+    """El proceso está en el grupo de primer plano de su terminal y no está suspendido (lectura directa)."""
+    try:
+        r = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(int(pid))], capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+    stat = r.stdout.strip()
+    return bool(stat) and "+" in stat and "T" not in stat
 
 
 def _es_interactiva(sid):
@@ -772,6 +824,7 @@ def construir_estado():
 def bucle():
     while True:
         try:
+            inventario.refrescar()   # ps/lsof fuera del lock (pueden tardar)
             with lock:
                 estado = construir_estado()
                 cache_estado["json"] = json.dumps(estado, ensure_ascii=False).encode()
@@ -938,7 +991,8 @@ class Manejador(BaseHTTPRequestHandler):
         self._enviar(codigo, json.dumps(datos, ensure_ascii=False).encode())
 
     def _destino(self, sid):
-        """tty y nombre de una sesión de Claude Code abierta en la CLI (para escribirle por voz)."""
+        """(tty, nombre, agente, pid) de una sesión abierta en Terminal (para escribirle por voz)."""
+        inventario.refrescar(max_edad=0)
         with lock:
             estado = json.loads(cache_estado["json"])
         for s in estado.get("sesiones", []):
@@ -946,10 +1000,10 @@ class Manejador(BaseHTTPRequestHandler):
                 if s.get("estado") in ("permiso", "respuesta"):
                     raise RuntimeError("primero contesta el permiso de esa sesión")
                 with lock:
-                    tty = codex.tty_de(sid)
-                if not tty:
-                    raise RuntimeError("no encontré la terminal de ese Codex (¿dos en la misma carpeta?)")
-                return tty, s.get("nombre") or s.get("proyecto") or "Codex", "codex"
+                    destino = codex.tty_de(sid)
+                if not destino:
+                    raise RuntimeError("no encontré una sola terminal de ese Codex en primer plano")
+                return destino[0], s.get("nombre") or s.get("proyecto") or "Codex", "codex", destino[1]
             if s.get("id") == sid and s.get("agente") != "codex":
                 if s.get("origen") != "cli":
                     raise RuntimeError("esa sesión no corre en una terminal")
@@ -964,7 +1018,9 @@ class Manejador(BaseHTTPRequestHandler):
                 tty = r.stdout.strip()
                 if not tty or tty == "??":
                     raise RuntimeError("la sesión no tiene terminal")
-                return "/dev/" + tty, s.get("nombre") or s.get("proyecto") or "sesión", "claude"
+                if not _en_primer_plano(s["pid"]):
+                    raise RuntimeError("Claude no está en primer plano en su terminal")
+                return "/dev/" + tty, s.get("nombre") or s.get("proyecto") or "sesión", "claude", s["pid"]
         raise RuntimeError("la sesión ya no está abierta")
 
     def _verificar_destino(self, p):
@@ -978,15 +1034,20 @@ class Manejador(BaseHTTPRequestHandler):
             raise RuntimeError("la sesión ya no está abierta")
         if s.get("estado") in ("permiso", "respuesta"):
             raise RuntimeError("primero contesta el permiso o la pregunta de esa sesión")
+        # Justo antes de teclear: la misma terminal, el mismo proceso, y en primer plano.
         if p.get("agente") == "codex":
+            inventario.refrescar(max_edad=0)
             with lock:
-                tty_actual = codex.tty_de(p["sid"]) or ""
+                actual = codex.tty_de(p["sid"])
+            tty_actual, pid_actual = actual if actual else ("", 0)
         else:
             try:
                 r = subprocess.run(["/bin/ps", "-o", "tty=", "-p", str(int(s["pid"]))], capture_output=True, text=True, timeout=3)
-                tty_actual = "/dev/" + r.stdout.strip()
+                tty_actual, pid_actual = "/dev/" + r.stdout.strip(), int(s["pid"])
             except (OSError, subprocess.SubprocessError, ValueError):
-                tty_actual = ""
+                tty_actual, pid_actual = "", 0
+        if pid_actual != p.get("pid") or not _en_primer_plano(pid_actual):
+            raise RuntimeError("la sesión ya no está en primer plano en su terminal; vuelve a dictar")
         if tty_actual != p.get("tty"):
             raise RuntimeError("la terminal de esa sesión cambió; vuelve a dictar")
         if p.get("sostener") and s.get("estado") != "en_espera":
@@ -1009,8 +1070,8 @@ class Manejador(BaseHTTPRequestHandler):
                     TRANSCRIBIENDO.release()
                 destino = parse_qs(urlparse(self.path).query).get("s", [""])[0]
                 if destino:                        # mensaje para una sesión abierta en Terminal
-                    tty, nombre, agente = self._destino(destino)
-                    return self._json(200, voz.preparar_mensaje(texto, tty, nombre, destino, agente))
+                    tty, nombre, agente, pid = self._destino(destino)
+                    return self._json(200, voz.preparar_mensaje(texto, tty, nombre, destino, agente, pid))
                 return self._json(200, voz.preparar(texto))
             datos = json.loads(cuerpo or b"{}")
             if ruta == "/api/voz/confirmar":       # placa: confirma la sesión pendiente
