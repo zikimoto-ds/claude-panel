@@ -18,6 +18,7 @@
 #include <Wire.h>
 #include <ESP_I2S.h>
 #include "TouchDrvCSTXXX.hpp"
+#include "XPowersLib.h"
 #include "es8311.h"
 #include "es7210.h"
 #include <mbedtls/sha256.h>
@@ -96,6 +97,90 @@ bool aplicar(JsonDocument &doc);
 uint32_t tFijo = 0;        // >0 durante una captura: las animaciones usan este tiempo
 bool modoDemo = false;     // datos ficticios para capturas/fotos (comando serial DEMO)
 uint32_t relojDibujo() { return tFijo ? tFijo : millis(); }
+
+// ------------------------------------------------------------ batería ----
+// PMU AXP2101 en el bus I2C compartido (SDA 15, SCL 14), dirección 0x34. Solo se leen el
+// porcentaje y la carga: la configuración del botón PWR (presión larga apaga) no se toca.
+XPowersAXP2101 pmu;
+bool hayPmu = false;
+struct Bateria { int pct = -1; bool cargando = false, usb = false; } bateria;   // pct -1: sin batería
+
+void iniciarPmu() {
+  hayPmu = pmu.begin(Wire, AXP2101_SLAVE_ADDRESS, 15, 14);
+  if (hayPmu) {
+    pmu.enableBattDetection();
+    pmu.enableBattVoltageMeasure();
+    pmu.enableVbusVoltageMeasure();
+    pmu.enableGauge();
+  }
+  Serial.printf("PMU: AXP2101 %s\n", hayPmu ? "OK" : "no responde");
+}
+
+void leerBateria(uint32_t ahora) {
+  static uint32_t ultima = 0;
+  if (!hayPmu || (ultima && ahora - ultima < 5000)) return;
+  ultima = ahora;
+  Bateria b;
+  b.pct = pmu.getBatteryPercent();
+  b.cargando = pmu.isCharging();
+  b.usb = pmu.isVbusIn();
+  if (b.pct != bateria.pct || b.cargando != bateria.cargando || b.usb != bateria.usb)
+    Serial.printf("Batería: %d%%%s%s, %u mV\n", b.pct, b.cargando ? ", cargando" : "", b.usb ? ", USB" : "",
+                  pmu.getBattVoltage());
+  bateria = b;
+}
+
+// ---------------------------------------------------- ahorro de pantalla ----
+// AMOLED: tras 2 min sin cambios ni toques baja el brillo; tras 10 min apaga el panel. Despierta
+// con un toque, BOOT o una alerta nueva de permiso. Cada 3 min el cuadro se mueve 1–3 px.
+const uint8_t BRILLO_NORMAL = 170, BRILLO_TENUE = 40;
+const uint32_t MS_ATENUAR = 2 * 60000UL, MS_APAGAR = 10 * 60000UL, MS_DESPLAZAR = 3 * 60000UL;
+enum Luz { ENCENDIDA, TENUE, APAGADA };
+Luz luz = ENCENDIDA;
+uint32_t ultimaActividad = 0;
+
+void ponerLuz(Luz l) {
+  if (l == luz) return;
+  if (luz == APAGADA) pantalla->displayOn();
+  if (l == APAGADA) {
+    pantalla->setBrightness(0);
+    pantalla->displayOff();
+  } else {
+    pantalla->setBrightness(l == TENUE ? BRILLO_TENUE : BRILLO_NORMAL);
+  }
+  luz = l;
+  Serial.printf("Pantalla: %s\n", l == ENCENDIDA ? "encendida" : l == TENUE ? "tenue" : "apagada");
+}
+
+// Marca actividad y enciende. Devuelve true si estaba apagada (ese toque o pulsación solo despierta).
+bool despertar() {
+  ultimaActividad = millis();
+  bool estabaApagada = luz == APAGADA;
+  ponerLuz(ENCENDIDA);
+  if (estabaApagada) ultimoDibujo = 0;   // redibujar ya
+  return estabaApagada;
+}
+
+// Desplaza el búfer completo (dx, dy) antes de enviarlo. Las columnas que "dan la vuelta" al
+// renglón vecino caen en el borde negro de la pantalla redonda. Las capturas no se desplazan.
+void desplazarLienzo() {
+  static const int8_t pasos[][2] = {{0, 0}, {2, 0}, {2, 2}, {0, 2}, {-2, 2}, {-2, 0}, {-2, -2}, {0, -2}, {2, -2},
+                                    {1, 1}, {3, 0}, {-1, 1}, {0, 3}, {-1, -1}, {-3, 0}, {1, -1}, {0, -3}};
+  if (tFijo || modoDemo) return;
+  const int8_t *p = pasos[(millis() / MS_DESPLAZAR) % (sizeof(pasos) / sizeof(pasos[0]))];
+  long k = (long)p[1] * ANCHO + p[0];
+  if (k == 0) return;
+  uint16_t *fb = lienzo->getFramebuffer();
+  const size_t n = (size_t)ANCHO * ALTO;
+  if (k > 0) {
+    memmove(fb + k, fb, (n - k) * sizeof(uint16_t));
+    memset(fb, 0, k * sizeof(uint16_t));
+  } else {
+    k = -k;
+    memmove(fb, fb + k, (n - k) * sizeof(uint16_t));
+    memset(fb + n - k, 0, k * sizeof(uint16_t));
+  }
+}
 
 // ------------------------------------------------------------------ red ----
 
@@ -401,6 +486,31 @@ void arco(int r1, int r2, float desde, float grados, uint16_t color) {
     lienzo->fillArc(CX, CY, r1, r2, ini, 360, color);
     lienzo->fillArc(CX, CY, r1, r2, 0, fin - 360, color);
   }
+}
+
+// Batería discreta centrada (línea base y): rayo si carga, icono con nivel y porcentaje.
+// En modo demo muestra un valor fijo para que las capturas no dependan de la placa.
+void dibujarBateria(int y) {
+  int pct = modoDemo ? 78 : bateria.pct;
+  bool carga = modoDemo ? false : bateria.cargando;
+  if (pct < 0) return;
+  pct = constrain(pct, 0, 100);
+  lienzo->setFont(u8g2_font_helvR08_tf);
+  String txt = String(pct) + "%";
+  const int w = 16, h = 8, wRayo = carga ? 9 : 0;
+  int x = CX - (wRayo + w + 2 + 4 + anchoTexto(txt)) / 2;
+  uint16_t cNivel = carga ? C_VERDE : pct <= 15 ? C_ROJO : C_TENUE;
+  if (carga) {   // rayo de 6×10
+    lienzo->fillTriangle(x + 5, y - h - 1, x, y - h / 2, x + 3, y - h / 2, C_PERMISO);
+    lienzo->fillTriangle(x + 2, y - h / 2 - 1, x + 6, y - h / 2 - 1, x + 1, y + 1, C_PERMISO);
+    x += wRayo;
+  }
+  lienzo->drawRect(x, y - h, w, h, C_TENUE);
+  lienzo->fillRect(x + w, y - h + 2, 2, h - 4, C_TENUE);
+  lienzo->fillRect(x + 2, y - h + 2, max(1, (w - 4) * pct / 100), h - 4, cNivel);
+  lienzo->setTextColor(pct <= 15 && !carga ? C_ROJO : C_TENUE);
+  lienzo->setCursor(x + w + 2 + 4, y);
+  lienzo->print(txt);
 }
 
 // ---- Muñequitos ----------------------------------------------------------------------------
@@ -779,6 +889,7 @@ void dibujar(bool encendidoAlerta) {
     centrado("Panel Claude Code", CY - 10, C_TINTA);
     lienzo->setFont(u8g2_font_helvR12_tf);
     centrado(errorTxt, CY + 22, C_TENUE);
+    desplazarLienzo();
     lienzo->flush();
     return;
   }
@@ -806,7 +917,9 @@ void dibujar(bool encendidoAlerta) {
   if (vista == PRINCIPAL || vista == TOKENS) {
     lienzo->fillCircle(CX - 8, 438, 3, vista == PRINCIPAL ? C_TINTA : C_GRIS);
     lienzo->fillCircle(CX + 8, 438, 3, vista == TOKENS ? C_TINTA : C_GRIS);
+    dibujarBateria(68);
   }
+  desplazarLienzo();
   lienzo->flush();
 }
 
@@ -883,6 +996,7 @@ void leerBoton() {
   if (millis() - tCambio < 30 || lectura == estable) return;   // antirrebote 30 ms
   estable = lectura;
   if (estable) return;                                         // solo el flanco de bajada
+  if (despertar()) return;                                     // pantalla apagada: solo despierta
   ultimoToque = millis();
   if (vista == GRABANDO) terminarGrabacion();
   else if (vista == DETALLE) {
@@ -922,6 +1036,7 @@ void leerTouch() {
       yi = y[0];
       int iIni = vista == DETALLE ? buscarDetalle() : -1;
       objetivoInicio = vista == CONFIRMAR ? pendiente.id : (iIni >= 0 ? estado.ses[iIni].espera : String(""));
+      if (despertar()) xi = -1000;   // pantalla apagada: este toque solo despierta
     }
     xu = x[0];
     yu = y[0];
@@ -1270,6 +1385,7 @@ const char *DEMO_SEIS = R"({"pct":71,"usado":11100000,"limite":15600000,"reinici
 void ponerDemo(const String &escena) {
   if (escena == "0") {
     modoDemo = false;
+    despertar();
     vista = PRINCIPAL;
     estado.valido = false;      // que se vea "Buscando servidor..." hasta el siguiente dato real
     Serial.println("DEMO apagado");
@@ -1281,6 +1397,7 @@ void ponerDemo(const String &escena) {
     return;
   }
   modoDemo = true;
+  despertar();   // demo y capturas con brillo normal
   aplicar(doc);
   progresoAprobar = 0;
   vista = PRINCIPAL;
@@ -1337,6 +1454,40 @@ void leerSerial() {
   }
 }
 
+// Huella de lo que importa ver: sesiones y sus estados (no porcentajes ni minutos, que cambian solos).
+uint32_t firmaEstado() {
+  uint32_t h = 2166136261u;
+  auto mezclar = [&](uint32_t v) { h = (h ^ v) * 16777619u; };
+  mezclar(estado.valido);
+  mezclar(estado.np);
+  mezclar(estado.nr);
+  mezclar(estado.nses);
+  for (int i = 0; i < estado.nses; i++) {
+    for (char c : estado.ses[i].clave) mezclar((uint8_t)c);
+    mezclar(estado.ses[i].estado);
+  }
+  return h;
+}
+
+// Atenuar / apagar según el tiempo sin actividad. Un cambio de sesiones cuenta como actividad
+// (devuelve el brillo si estaba tenue), pero no enciende una pantalla apagada: eso es solo para
+// toque, BOOT y alerta de permiso. Fuera de la principal y la de consumo no se atenúa.
+void gestionarLuz(uint32_t ahora) {
+  static uint32_t firmaPrevia = 0;
+  uint32_t f = firmaEstado();
+  if (f != firmaPrevia) {
+    firmaPrevia = f;
+    if (luz != APAGADA) {
+      ultimaActividad = ahora;
+      ponerLuz(ENCENDIDA);
+    }
+  }
+  if (vista != PRINCIPAL && vista != TOKENS) ultimaActividad = ahora;
+  uint32_t quieto = ahora - ultimaActividad;
+  if (quieto >= MS_APAGAR) ponerLuz(APAGADA);
+  else if (quieto >= MS_ATENUAR && luz == ENCENDIDA) ponerLuz(TENUE);
+}
+
 void setup() {
   Serial.begin(115200);
   if (!lienzo->begin()) Serial.println("Fallo al iniciar pantalla/lienzo");
@@ -1345,6 +1496,8 @@ void setup() {
   dibujar(false);
 
   Wire.begin(15, 14);  // bus I2C compartido: touch, ES8311, PMU
+  iniciarPmu();
+  leerBateria(millis());
   iniciarTouch();
   iniciarAudio();
   iniciarMicros();
@@ -1381,6 +1534,7 @@ void setup() {
 void loop() {
   uint32_t ahora = millis();
   leerSerial();
+  leerBateria(ahora);
   if (modoDemo) {
     if (ahora - ultimoDibujo >= 250) {
       ultimoDibujo = ahora;
@@ -1434,6 +1588,7 @@ void loop() {
   if (estado.valido) {
     if (naPrevio >= 0 && estado.na != naPrevio && estado.np > 0) {
       sonar = true;
+      despertar();
       if (!enVoz) vista = PRINCIPAL;
     }
     naPrevio = estado.na;
@@ -1446,8 +1601,9 @@ void loop() {
   int iDetT = vista == DETALLE ? buscarDetalle() : -1;
   uint32_t limiteVista = (iDetT >= 0 && estado.ses[iDetT].espera.length()) ? 60000 : 20000;
   if ((vista == TOKENS || vista == DETALLE) && millis() - ultimoToque > limiteVista) vista = PRINCIPAL;
-  // Redibuja a 4 Hz: animación de los muñequitos
-  if (ahora - ultimoDibujo >= 250) {
+  gestionarLuz(millis());
+  // Redibuja a 4 Hz: animación de los muñequitos (nada con la pantalla apagada)
+  if (luz != APAGADA && ahora - ultimoDibujo >= 250) {
     ultimoDibujo = ahora;
     dibujar((ahora / 500) % 2 == 0);
   }

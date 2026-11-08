@@ -29,6 +29,7 @@ Each open session on your Mac becomes a small pixel character: **orange for Clau
 | <img src="docs/img/grabando.png" width="220"> | **Voice.** Press the BOOT button, speak, press again. The audio is transcribed **locally** with whisper.cpp on the Mac. From the main screen it starts a new session; from a session's detail it sends a message to that session. |
 | <img src="docs/img/comando.png" width="220"> | **Voice commands, closed list.** "comando compactar" → `/compact`, "comando limpiar" → `/clear`, "comando salir" → `/exit` (Codex: `/quit`). Destructive ones need a hold and an idle session. |
 | <img src="docs/img/tokens.png" width="220"> | **Usage.** Swipe for the 5‑hour block, the week and today, calibrated against claude.ai → Usage. |
+| | **Battery and screen care.** Battery level (and a bolt while charging) is read from the AXP2101 and shown small at the top of the overview and usage screens. To protect the AMOLED, the screen dims after 2 minutes with no touches or session changes and turns off after 10; a tap, BOOT or a new permission request wakes it (the tap or press that wakes it does nothing else). Every 3 minutes the whole frame shifts 1–3 px so the ring and fixed text don't burn in. The PWR button keeps its default behavior (long press powers off). |
 
 More screens: [session detail](docs/img/detalle.png) · [new session from voice](docs/img/mensaje.png).
 
@@ -53,7 +54,7 @@ flowchart LR
 | `servidor.py` | HTTP server, Python standard library only. Reads `~/.claude/sessions`, transcripts and hook events; builds a compact state for the board; holds permission requests until the board answers. |
 | `hook.sh` | Hook for Claude Code and Codex (`hook.sh codex`). Forwards events; on `PermissionRequest` it waits for the board's decision. |
 | `voz.py` | Local transcription (whisper.cpp), launching sessions in Terminal, typing messages into an existing session's tab. |
-| `firmware/` | PlatformIO + Arduino (pioarduino), Arduino_GFX, U8g2, ArduinoJson, SensorLib. Vendored ES8311/ES7210 audio drivers from Espressif. |
+| `firmware/` | PlatformIO + Arduino (pioarduino), Arduino_GFX, U8g2, ArduinoJson, SensorLib, XPowersLib. Vendored ES8311/ES7210 audio drivers from Espressif. |
 | `herramientas/captura.py` | Dumps the board's framebuffer over USB in demo mode and writes the PNGs/GIF used here. |
 
 ## Hardware
