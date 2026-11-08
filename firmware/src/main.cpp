@@ -93,6 +93,9 @@ uint32_t ultimoSondeoLan = 0;
 WiFiClientSecure clienteTls;
 
 bool aplicar(JsonDocument &doc);
+uint32_t tFijo = 0;        // >0 durante una captura: las animaciones usan este tiempo
+bool modoDemo = false;     // datos ficticios para capturas/fotos (comando serial DEMO)
+uint32_t relojDibujo() { return tFijo ? tFijo : millis(); }
 
 // ------------------------------------------------------------------ red ----
 
@@ -553,7 +556,7 @@ void lugar(int i, int n, int &x, int &y, int &s) {
 }
 
 void dibujarPrincipal(bool) {
-  uint32_t t = millis();
+  uint32_t t = relojDibujo();
   // Anillo delgado: bloque de 5 h de Claude
   float pct = constrain(estado.pct, 0.0f, 100.0f);
   lienzo->fillArc(CX, CY, 226, 221, 0, 360, C_PISTA);
@@ -677,7 +680,7 @@ bool enBoton(int x, int y, int bx) { return x >= bx && x <= bx + BTN_W && y >= B
 void dibujarPermiso(const Sesion &s) {
   lienzo->fillArc(CX, CY, 224, 216, 0, 360, C_PERMISO);
   static uint32_t tCongelado = 0;
-  if (progresoAprobar == 0) tCongelado = millis();
+  if (progresoAprobar == 0) tCongelado = relojDibujo();
   dibujarEscena(CX + 36, 80, 3, 3, s.agente, s.estado, tCongelado, true, 40);
   lienzo->setFont(u8g2_font_helvB12_tf);
   centrado(recortar(s.nombre, 300), 132, C_TINTA);
@@ -713,7 +716,7 @@ void dibujarDetalle(const Sesion &s) {
   if (s.estado == 'P' && s.espera.length()) return dibujarPermiso(s);
   uint16_t cEstado = s.estado == 'T' ? C_VERDE : s.estado == 'P' ? C_AMBAR : s.estado == 'R' ? C_TINTA : C_TENUE;
   lienzo->fillArc(CX, CY, 224, 216, 0, 360, cEstado);
-  dibujarEscena(CX + 36, 78, 3, 3, s.agente, s.estado, millis(), true, 40);
+  dibujarEscena(CX + 36, 78, 3, 3, s.agente, s.estado, relojDibujo(), true, 40);
 
   lienzo->setFont(u8g2_font_helvB14_tf);
   String renglones[3];
@@ -796,7 +799,8 @@ void dibujar(bool encendidoAlerta) {
 
   // Estado de conexión
   lienzo->setFont(u8g2_font_helvR08_tf);
-  if (errorTxt.length() && fallos > 0) centrado(errorTxt, 420, C_ROJO);  // datos viejos: avisar sin borrar
+  if (modoDemo) {}                                                      // capturas limpias
+  else if (errorTxt.length() && fallos > 0) centrado(errorTxt, 420, C_ROJO);  // datos viejos: avisar sin borrar
   else if (modoTunel) centrado("vía túnel", 420, C_TENUE);
   // Indicador de página (principal / tokens)
   if (vista == PRINCIPAL || vista == TOKENS) {
@@ -1182,10 +1186,10 @@ void lanzarPendiente() {
 }
 
 void dibujarGrabando() {
-  float seg = (millis() - inicioGrab) / 1000.0f;
+  float seg = (relojDibujo() - inicioGrab) / 1000.0f;
   lienzo->fillArc(CX, CY, 224, 210, 0, 360, C_PISTA);
   arco(224, 210, 0, min(seg / MAX_SEG_VOZ, 1.0f) * 360, C_ROJO);
-  lienzo->fillCircle(CX, CY - 40, 36, (millis() / 400) % 2 ? C_ROJO : 0x9000);
+  lienzo->fillCircle(CX, CY - 40, 36, (relojDibujo() / 400) % 2 ? C_ROJO : 0x9000);
   lienzo->setFont(u8g2_font_helvB18_tf);
   centrado("Escuchando...", CY + 30, C_TINTA);
   lienzo->setFont(u8g2_font_helvR12_tf);
@@ -1240,6 +1244,99 @@ void dibujarAviso() {
 
 // --------------------------------------------------------------- setup ----
 
+// ---------------------------------------------------------- demo y captura ----
+// Por el serial USB:  "DEMO <escena>"  pone datos ficticios (no se conecta al servidor) y la vista;
+// "DEMO 0" vuelve a los datos reales;  "CAPTURA <ms>"  dibuja el cuadro con el reloj en <ms> y lo
+// manda crudo (RGB565): "CAPTURA 466 466 <bytes> <suma>\n" + bytes + "\nFIN\n".
+// Sirve para las imágenes del README sin mostrar sesiones, carpetas ni comandos reales.
+const char *DEMO_BASE = R"({"pct":38,"usado":5900000,"limite":15600000,"reinicia":"17:40","psem":21,
+ "usem":10900000,"lsem":52000000,"rsem":"mié 21:00","hoy":7400000,"hmsg":312,"na":0,"np":1,"nt":2,"nr":0,"total":4,
+ "ses":[
+  {"n":"Refactor auth middleware","p":"api-server","e":"T","a":"c","k":"d1","og":"cli","min":42,"o":18400,"i":"demo1"},
+  {"n":"Landing page copy","p":"web","e":"P","a":"c","k":"d2","m":"Bash","w":35,"og":"cli","min":17,"o":5200,
+   "q":"demoq","r":"npm run build && npm run deploy -- --prod"},
+  {"n":"Fix flaky tests","p":"api-server","e":"T","a":"x","k":"d3","og":"codex","min":9},
+  {"n":"Docs cleanup","p":"docs","e":"E","a":"c","k":"d4","og":"escritorio","min":120,"o":30100}]})";
+const char *DEMO_SEIS = R"({"pct":71,"usado":11100000,"limite":15600000,"reinicia":"17:40","psem":44,
+ "usem":22900000,"lsem":52000000,"rsem":"mié 21:00","hoy":13200000,"hmsg":540,"na":0,"np":1,"nt":3,"nr":1,"total":6,
+ "ses":[
+  {"n":"Refactor auth","p":"api-server","e":"T","a":"c","k":"d1","og":"cli","min":42,"i":"demo1"},
+  {"n":"Landing page","p":"web","e":"P","a":"c","k":"d2","m":"Bash","og":"cli","min":17,"q":"demoq","r":"npm run deploy"},
+  {"n":"Flaky tests","p":"api-server","e":"T","a":"x","k":"d3","og":"codex","min":9},
+  {"n":"DB migration","p":"api-server","e":"R","a":"c","k":"d5","og":"cli","min":5},
+  {"n":"Release notes","p":"cli","e":"T","a":"x","k":"d6","og":"codex","min":3},
+  {"n":"Docs cleanup","p":"docs","e":"E","a":"c","k":"d4","og":"escritorio","min":120}]})";
+
+void ponerDemo(const String &escena) {
+  if (escena == "0") {
+    modoDemo = false;
+    vista = PRINCIPAL;
+    estado.valido = false;      // que se vea "Buscando servidor..." hasta el siguiente dato real
+    Serial.println("DEMO apagado");
+    return;
+  }
+  JsonDocument doc;
+  if (deserializeJson(doc, escena == "seis" ? DEMO_SEIS : DEMO_BASE)) {
+    Serial.println("DEMO: JSON inválido");
+    return;
+  }
+  modoDemo = true;
+  aplicar(doc);
+  progresoAprobar = 0;
+  vista = PRINCIPAL;
+  if (escena == "permiso") { detalleClave = "d2"; vista = DETALLE; }
+  else if (escena == "detalle") { detalleClave = "d1"; vista = DETALLE; }
+  else if (escena == "tokens") vista = TOKENS;
+  else if (escena == "grabando") {
+    destinoNombre = "Refactor auth middleware";
+    inicioGrab = relojDibujo() - 4300;
+    vista = GRABANDO;
+  } else if (escena == "comando") {
+    pendiente = Pendiente();
+    pendiente.texto = "/compact";
+    pendiente.destino = "Refactor auth middleware";
+    pendiente.comando = true;
+    vista = CONFIRMAR;
+  } else if (escena == "mensaje") {
+    pendiente = Pendiente();
+    pendiente.texto = "Write integration tests for the payments module and run them";
+    pendiente.carpeta = "~/proyectos/api-server";
+    vista = CONFIRMAR;
+  }
+  Serial.printf("DEMO %s\n", escena.c_str());
+}
+
+void capturar(uint32_t t) {
+  uint32_t antes = tFijo;
+  tFijo = t ? t : millis();
+  if (vista == GRABANDO) inicioGrab = tFijo - 4300;   // mismo segundero en todos los cuadros
+  dibujar(true);
+  tFijo = antes;
+  const uint8_t *buf = (const uint8_t *)lienzo->getFramebuffer();
+  const size_t n = (size_t)ANCHO * ALTO * 2;
+  uint32_t suma = 0;
+  for (size_t i = 0; i < n; i++) suma += buf[i];
+  Serial.printf("CAPTURA %d %d %u %lu\n", ANCHO, ALTO, (unsigned)n, (unsigned long)suma);
+  for (size_t i = 0; i < n; i += 4096) Serial.write(buf + i, min((size_t)4096, n - i));
+  Serial.print("\nFIN\n");
+  Serial.flush();
+}
+
+void leerSerial() {
+  static String linea;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      linea.trim();
+      if (linea.startsWith("DEMO ")) ponerDemo(linea.substring(5));
+      else if (linea.startsWith("CAPTURA")) capturar(linea.length() > 8 ? (uint32_t)linea.substring(8).toInt() : 0);
+      linea = "";
+    } else if (linea.length() < 64) {
+      linea += c;
+    }
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   if (!lienzo->begin()) Serial.println("Fallo al iniciar pantalla/lienzo");
@@ -1283,6 +1380,15 @@ void setup() {
 
 void loop() {
   uint32_t ahora = millis();
+  leerSerial();
+  if (modoDemo) {
+    if (ahora - ultimoDibujo >= 250) {
+      ultimoDibujo = ahora;
+      dibujar(true);
+    }
+    delay(20);
+    return;
+  }
   static uint32_t ultimaRevisionRed = 0, ultimoReintento = 0;
   if (ahora - ultimaRevisionRed >= 1000) {
     ultimaRevisionRed = ahora;
