@@ -1,0 +1,11 @@
+.venv/
+.env.local
+firmware/include/secrets.h
+firmware/.pio/
+__pycache__/
+estado_codex.json
+# Modelos de whisper (~1 GB): se descargan aparte
+modelos/
+# Scripts temporales de sesiones lanzadas por voz
+lanzamientos/
+.DS_Store
