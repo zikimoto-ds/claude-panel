@@ -164,7 +164,10 @@ def confirmar(ident):
 def _una_linea(texto):
     """Una sola línea sin caracteres de control (un salto de línea mandaría el mensaje a medias)."""
     limpio = "".join(c if c.isprintable() else " " for c in str(texto))
-    return " ".join(limpio.split())[:2000]
+    limpio = " ".join(limpio.split())
+    # Prefijos con significado en la terminal de Claude Code: "!" ejecuta bash sin pedir permiso,
+    # "/" corre comandos de la app (p. ej. /exit) y "#" escribe en la memoria.
+    return limpio.lstrip("!/#\uff01 ").strip()[:2000]
 
 
 # Escribe en la pestaña de Terminal cuya tty coincide y que tiene un proceso corriendo, como si se
