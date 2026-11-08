@@ -61,6 +61,23 @@ TOKEN = os.environ.get("PANEL_TOKEN", "")
 TOKEN_SIRI = os.environ.get("PANEL_TOKEN_SIRI", "")
 HOSTS_TUNEL = (".ngrok-free.dev", ".ngrok-free.app", ".ngrok.app", ".ngrok.io", ".ngrok.dev")
 HOSTS_EXTRA = {h.strip().lower() for h in os.environ.get("PANEL_HOSTS", "").split(",") if h.strip()}
+
+
+def _nombre_mdns():
+    """Nombre .local de esta Mac (no se acepta cualquier .local: otro equipo de la red podría
+    anunciar uno propio por mDNS y usarlo para DNS rebinding)."""
+    try:
+        r = subprocess.run(["/usr/sbin/scutil", "--get", "LocalHostName"], capture_output=True, text=True, timeout=3)
+        nombre = r.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        nombre = ""
+    if not nombre:
+        import socket
+        nombre = socket.gethostname().split(".")[0]
+    return (nombre.lower() + ".local") if nombre else ""
+
+
+HOST_MDNS = _nombre_mdns()
 ESPERA_PERMISO_MAX = 590   # s que un hook PermissionRequest espera la decisión de la placa (timeout del hook: 600)
 # Topes calibrados contra claude.ai → Settings → Usage (métrica: entrada + escritura de caché + salida).
 LIMITE_SESION = int(os.environ.get("PANEL_LIMITE_SESION", os.environ.get("PANEL_LIMITE_5H", "15600000")))
@@ -710,7 +727,7 @@ class Manejador(BaseHTTPRequestHandler):
 
     def _host_valido(self):
         """Contra DNS rebinding: una página web que resuelva su dominio a 127.0.0.1 llega con su
-        propio Host. Solo se aceptan IPs, localhost, nombres .local y el dominio del túnel."""
+        propio Host. Solo se aceptan IPs, localhost, el nombre .local de esta Mac, el túnel y PANEL_HOSTS."""
         host = (self.headers.get("Host") or "").strip().lower()
         if host.startswith("["):
             host = host[1:].split("]")[0]
@@ -723,7 +740,7 @@ class Manejador(BaseHTTPRequestHandler):
             return True
         except ValueError:
             pass
-        return host == "localhost" or host.endswith(".local") or host.endswith(HOSTS_TUNEL) or host in HOSTS_EXTRA
+        return host == "localhost" or (HOST_MDNS and host == HOST_MDNS) or host.endswith(HOSTS_TUNEL) or host in HOSTS_EXTRA
 
     def _autorizado(self, qs, cuerpo=None, solo_firma=False, sin_local=False):
         """solo_firma: exige HMAC (la placa) aunque se esté en la red local; lo usan las aprobaciones.
