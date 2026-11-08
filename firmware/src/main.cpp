@@ -124,22 +124,21 @@ int pedirLocal(JsonDocument &doc) {
   http.setConnectTimeout(800);
   http.setTimeout(1500);
   if (!http.begin("http://" + servidor + ":" + String(SERVIDOR_PUERTO) + "/api/placa")) return -100;
-  // Firma HMAC con hora (el token no viaja). Sin hora NTP, en red local se manda el token.
+  // Firma HMAC con hora: el token nunca viaja. Sin hora NTP todavía no se consulta.
   time_t ts = time(nullptr);
-  bool conHora = ts > 1700000000;
+  if (ts <= 1700000000) {
+    http.end();
+    return -300;
+  }
   const char *cabeceras[] = {"X-Panel-Firma-Resp"};
   http.collectHeaders(cabeceras, 1);
   String tsTxt = String((long)ts);
-  if (conHora) {
-    http.addHeader("X-Panel-Ts", tsTxt);
-    http.addHeader("X-Panel-Firma", hmacHex("GET /api/placa " + tsTxt));
-  } else {
-    http.addHeader("X-Panel-Token", PANEL_TOKEN);
-  }
+  http.addHeader("X-Panel-Ts", tsTxt);
+  http.addHeader("X-Panel-Firma", hmacHex("GET /api/placa " + tsTxt));
   int codigo = http.GET();
   if (codigo == 200) {
     String cuerpo = http.getString();
-    if (conHora && !hmacHex(tsTxt + "\n" + cuerpo).equals(http.header("X-Panel-Firma-Resp"))) codigo = -400;
+    if (!hmacHex(tsTxt + "\n" + cuerpo).equals(http.header("X-Panel-Firma-Resp"))) codigo = -400;
     else if (deserializeJson(doc, cuerpo)) codigo = -200;
   }
   http.end();
@@ -272,6 +271,10 @@ void actualizarDatos(uint32_t ahora) {
     if (codigo == 200) {
       fallos = 0;
       aplicar(doc);
+      return;
+    }
+    if (codigo == -300) {   // sin hora no hay firma: esperar NTP sin contar como fallo
+      errorTxt = "Sincronizando hora...";
       return;
     }
     errorTxt = codigo == 401 ? "Firma rechazada" : codigo == -400 ? "Respuesta sin firma válida" : "Sin servidor";

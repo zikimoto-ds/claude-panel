@@ -20,6 +20,7 @@ Variables de entorno:
 import glob
 import hashlib
 import hmac
+import ipaddress
 import json
 import subprocess
 import sys
@@ -58,6 +59,8 @@ TOKEN = os.environ.get("PANEL_TOKEN", "")
 # Token aparte para el Atajo de Siri: solo crea sesiones (/api/sesion). Por el túnel ngrok ve los
 # encabezados en claro, así que el token principal nunca se acepta en texto plano por ahí.
 TOKEN_SIRI = os.environ.get("PANEL_TOKEN_SIRI", "")
+HOSTS_TUNEL = (".ngrok-free.dev", ".ngrok-free.app", ".ngrok.app", ".ngrok.io", ".ngrok.dev")
+HOSTS_EXTRA = {h.strip().lower() for h in os.environ.get("PANEL_HOSTS", "").split(",") if h.strip()}
 ESPERA_PERMISO_MAX = 590   # s que un hook PermissionRequest espera la decisión de la placa (timeout del hook: 600)
 # Topes calibrados contra claude.ai → Settings → Usage (métrica: entrada + escritura de caché + salida).
 LIMITE_SESION = int(os.environ.get("PANEL_LIMITE_SESION", os.environ.get("PANEL_LIMITE_5H", "15600000")))
@@ -705,9 +708,27 @@ class Manejador(BaseHTTPRequestHandler):
         esperada = hmac.new(TOKEN.encode(), mensaje.encode(), "sha256").hexdigest()
         return hmac.compare_digest(firma, esperada)
 
-    def _autorizado(self, qs, cuerpo=None, solo_firma=False):
-        """solo_firma: exige HMAC (la placa) aunque se esté en la red local; lo usan las aprobaciones."""
-        if self._es_local() and not solo_firma:
+    def _host_valido(self):
+        """Contra DNS rebinding: una página web que resuelva su dominio a 127.0.0.1 llega con su
+        propio Host. Solo se aceptan IPs, localhost, nombres .local y el dominio del túnel."""
+        host = (self.headers.get("Host") or "").strip().lower()
+        if host.startswith("["):
+            host = host[1:].split("]")[0]
+        else:
+            host = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+        if not host:
+            return False
+        try:
+            ipaddress.ip_address(host)
+            return True
+        except ValueError:
+            pass
+        return host == "localhost" or host.endswith(".local") or host.endswith(HOSTS_TUNEL) or host in HOSTS_EXTRA
+
+    def _autorizado(self, qs, cuerpo=None, solo_firma=False, sin_local=False):
+        """solo_firma: exige HMAC (la placa) aunque se esté en la red local; lo usan las aprobaciones.
+        sin_local: la petición local también necesita firma o token (rutas que lanzan sesiones)."""
+        if self._es_local() and not solo_firma and not sin_local:
             return True
         if not TOKEN:
             return False
@@ -741,6 +762,8 @@ class Manejador(BaseHTTPRequestHandler):
 
     def do_GET(self):
         u = urlparse(self.path)
+        if not self._host_valido():
+            return self._enviar(403, b'{"error":"host no permitido"}')
         qs = parse_qs(u.query)
         if u.path in ("/", "/index.html"):
             if not self._autorizado(qs):
@@ -808,7 +831,7 @@ class Manejador(BaseHTTPRequestHandler):
             cuerpo = self._leer_cuerpo(2_000_000)   # ~60 s de audio a 16 kHz mono
         except ValueError as e:
             return self._json(413, {"error": str(e)})
-        if not self._autorizado({}, cuerpo):
+        if not self._autorizado({}, cuerpo, sin_local=True):
             return self._json(401, {"error": "firma"})
         try:
             if ruta == "/api/voz":                 # placa: audio PCM -> texto pendiente de confirmar
@@ -901,6 +924,10 @@ class Manejador(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urlparse(self.path)
+        # Ningún cliente legítimo (placa, hooks, Siri) manda Origin: solo los navegadores.
+        # Así una página web abierta en la Mac no puede lanzar sesiones ni falsear hooks.
+        if self.headers.get("Origin") is not None or not self._host_valido():
+            return self._enviar(403, b'{"error":"origen no permitido"}')
         if u.path in ("/api/voz", "/api/voz/confirmar", "/api/sesion"):
             return self._post_voz(u.path)
         if u.path == "/api/permiso":

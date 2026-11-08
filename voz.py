@@ -117,9 +117,18 @@ def transcribir(pcm):
     return texto
 
 
+def _sin_opciones(texto):
+    """Quita guiones iniciales: `claude` tomaría "--algo" como opción de línea de comandos
+    (p. ej. --dangerously-skip-permissions) en vez de como instrucción."""
+    return texto.lstrip("-\u2013\u2014 \t\r\n")
+
+
 def preparar(texto):
     """Registra una sesión pendiente de confirmar. Devuelve el dict que se manda a la placa."""
     carpeta, instruccion = separar_carpeta(texto)
+    instruccion = _sin_opciones(instruccion)
+    if not instruccion:
+        raise RuntimeError("instrucción vacía")
     ident = uuid.uuid4().hex[:12]
     with _lock:
         ahora = time.time()
@@ -144,6 +153,9 @@ def lanzar(instruccion, carpeta):
     """Abre una ventana de Terminal con `claude "<instrucción>"` en la carpeta indicada.
     La instrucción va en un archivo aparte y se lee con $(cat ...): nunca se interpola en el
     script, así que no hay inyección de comandos. La carpeta solo puede ser ~ o una de ~/proyectos."""
+    instruccion = _sin_opciones(instruccion)
+    if not instruccion:
+        raise RuntimeError("instrucción vacía")
     carpeta = Path(carpeta)
     if not (carpeta == CARPETA_DEFECTO or carpeta.parent == RAIZ_PROYECTOS) or not carpeta.is_dir():
         raise RuntimeError("carpeta no permitida")
