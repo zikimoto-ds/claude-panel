@@ -154,22 +154,25 @@ COMANDOS = {
     "limpiar": ("/clear", True), "limpia": ("/clear", True),
     "salir": ("/exit", True), "sal": ("/exit", True),
 }
-_PERMITIDOS = {v[0] for v in COMANDOS.values()}
+# Codex: solo salir (/quit, probado: cierra y manda SessionEnd).
+COMANDOS_CODEX = {"salir": ("/quit", True), "sal": ("/quit", True)}
+_PERMITIDOS = {v[0] for v in COMANDOS.values()} | {v[0] for v in COMANDOS_CODEX.values()}
 
 
-def comando_dictado(texto):
+def comando_dictado(texto, agente="claude"):
     """'Comando compactar.' -> ('/compact', False). None si no empieza con "comando".
     Si empieza con "comando" pero no está en la lista, error (nunca se adivina)."""
     norm = _normalizar(texto)
+    tabla = COMANDOS_CODEX if agente == "codex" else COMANDOS
     m = re.fullmatch(r"comando (\w+)", norm)
-    if m and m.group(1) in COMANDOS:
-        return COMANDOS[m.group(1)]
+    if m and m.group(1) in tabla:
+        return tabla[m.group(1)]
     return None   # cualquier otra cosa es un mensaje normal ("comando de git falló…")
 
 
-def preparar_mensaje(texto, tty, nombre, sid=""):
+def preparar_mensaje(texto, tty, nombre, sid="", agente="claude"):
     """Mensaje (o comando de la lista) pendiente de confirmar para una sesión abierta en Terminal."""
-    cmd = comando_dictado(texto)
+    cmd = comando_dictado(texto, agente)
     if cmd:
         texto, sostener = cmd
     else:
@@ -180,7 +183,7 @@ def preparar_mensaje(texto, tty, nombre, sid=""):
     with _lock:
         _purgar()
         _pendientes[ident] = {"tipo": "mensaje", "texto": texto, "tty": tty, "destino": nombre, "sid": sid,
-                              "comando": bool(cmd), "sostener": sostener, "ts": time.time()}
+                              "comando": bool(cmd), "sostener": sostener, "agente": agente, "ts": time.time()}
     return {"id": ident, "texto": texto[:400], "carpeta": "", "destino": nombre[:60],
             "comando": 1 if cmd else 0, "sostener": 1 if sostener else 0}
 
@@ -194,7 +197,7 @@ def confirmar(ident, verificar=None):
     if p.get("tipo") == "mensaje":
         if verificar:
             verificar(p)
-        enviar_a_terminal(p["tty"], p["texto"], comando=p.get("comando", False))
+        enviar_a_terminal(p["tty"], p["texto"], comando=p.get("comando", False), agente=p.get("agente", "claude"))
         return {"ok": True, "destino": p["destino"][:60]}
     lanzar(p["texto"], p["carpeta"])
     return {"ok": True, "carpeta": _ruta_corta(p["carpeta"])}
@@ -215,11 +218,14 @@ _SCRIPT_TERMINAL = """
 on run argv
   set objetivo to item 1 of argv
   set texto to item 2 of argv
+  set conCR to (item 3 of argv) is "cr"
   tell application "Terminal"
     repeat with w in windows
       repeat with t in tabs of w
         if (tty of t is objetivo) and (busy of t) then
           do script texto in t
+          -- Codex no envía con el salto de línea de "do script": necesita un Enter (CR) aparte.
+          if conCR then do script (ASCII character 13) in t
           return "ok"
         end if
       end repeat
@@ -230,7 +236,7 @@ end run
 """
 
 
-def enviar_a_terminal(tty, texto, comando=False):
+def enviar_a_terminal(tty, texto, comando=False, agente="claude"):
     if comando:
         if texto not in _PERMITIDOS:     # solo los comandos exactos de la lista
             raise RuntimeError("comando no permitido")
@@ -238,7 +244,7 @@ def enviar_a_terminal(tty, texto, comando=False):
         texto = _una_linea(texto)
     if not re.fullmatch(r"/dev/ttys\d+", tty or ""):
         raise RuntimeError("terminal no válida")
-    r = subprocess.run(["/usr/bin/osascript", "-e", _SCRIPT_TERMINAL, tty, texto],
+    r = subprocess.run(["/usr/bin/osascript", "-e", _SCRIPT_TERMINAL, tty, texto, "cr" if agente == "codex" else "lf"],
                        capture_output=True, text=True, timeout=10)
     if r.returncode != 0:
         if "-1743" in r.stderr:

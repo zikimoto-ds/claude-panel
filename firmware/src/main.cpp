@@ -890,7 +890,7 @@ void leerBoton() {
       destinoNombre = estado.ses[iDet].nombre;
       iniciarGrabacion();
     } else {
-      mostrarAviso("Esta sesión no recibe mensajes por voz: solo las de Claude en la app Terminal", C_AMBAR);
+      mostrarAviso("Esta sesión no recibe mensajes por voz: solo Claude o Codex abiertos en la app Terminal", C_AMBAR);
     }
   } else if (vista == PRINCIPAL || vista == TOKENS || vista == AVISO) {
     destinoSid = "";

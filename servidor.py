@@ -406,8 +406,14 @@ class SesionesCodex:
             return
         s = self.ses.setdefault(sid, {"cwd": "", "pid": 0, "estado": "en_espera", "inicio": ahora})
         s["cwd"] = str(d.get("cwd") or s["cwd"])
-        if 1 < pid < 10_000_000:
+        if 1 < pid < 10_000_000 and pid != s.get("pid"):
             s["pid"] = pid
+            s["plugin"] = _de_plugin(pid)
+        if evento == "Stop" and s.get("plugin"):
+            # Consulta que hizo Claude con el plugin de Codex: terminó su tarea, ya no se muestra.
+            self.ses.pop(sid, None)
+            self._guardar()
+            return
         s["cambio"] = ahora
         s["evento"] = evento
         if evento == "PermissionRequest":
@@ -458,9 +464,45 @@ class SesionesCodex:
             cls._ps_cache = (time.time(), lineas)
         return lineas
 
+    _tuis_cache = (0.0, {})
+
+    @classmethod
+    def _tuis(cls):
+        """carpeta -> {tty} de los Codex abiertos en una terminal (no app-server), en caché 3 s."""
+        t, mapa = cls._tuis_cache
+        if time.time() - t <= 3:
+            return mapa
+        mapa, ttys = {}, {}
+        try:
+            r = subprocess.run(["/bin/ps", "-ax", "-o", "pid=,tty=,command="], capture_output=True, text=True, timeout=3)
+            for l in r.stdout.splitlines():
+                partes = l.split(None, 2)
+                if len(partes) < 3 or partes[1] == "??":
+                    continue
+                c = partes[2]
+                if "app-server" in c or "code-mode-host" in c or "/.claude/plugins/" in c:
+                    continue
+                exe = (c.split() + ["", ""])[1] if c.startswith("node ") else c.split()[0]
+                if exe.endswith("/codex"):
+                    ttys[partes[0]] = "/dev/" + partes[1]
+            if ttys:
+                r = subprocess.run(["/usr/sbin/lsof", "-a", "-d", "cwd", "-Fn", "-p", ",".join(ttys)],
+                                   capture_output=True, text=True, timeout=5)
+                actual = None
+                for l in r.stdout.splitlines():
+                    if l.startswith("p"):
+                        actual = l[1:]
+                    elif l.startswith("n") and actual in ttys:
+                        mapa.setdefault(l[1:].rstrip("/"), set()).add(ttys[actual])
+        except (OSError, subprocess.SubprocessError):
+            pass
+        cls._tuis_cache = (time.time(), mapa)
+        return mapa
+
     def _viva(self, s):
         """Los hooks de las sesiones de terminal los corre el daemon de Codex (--managed-daemon), que
-        sigue vivo al cerrar la ventana: para esas, la sesión vive mientras haya algún `codex` de terminal."""
+        sigue vivo al cerrar la ventana: para esas, la sesión vive mientras haya un Codex de terminal
+        abierto en su misma carpeta."""
         pid = s.get("pid") or 0
         if not pid:
             return True
@@ -470,24 +512,26 @@ class SesionesCodex:
         cmd = next((l.split(None, 1)[1] for l in lineas if l.split(None, 1)[0] == str(pid) and " " in l.strip()), "")
         if "--managed-daemon" not in cmd:
             return True
-        for l in lineas:
-            partes = l.split(None, 1)
-            if len(partes) < 2:
-                continue
-            c = partes[1]
-            if "app-server" in c or "code-mode-host" in c:
-                continue
-            exe = c.split()[0] if not c.startswith("node ") else (c.split() + [""])[1]
-            if exe.endswith("/bin/codex") or exe.endswith("/codex"):
-                return True
-        return False
+        return s.get("cwd", "").rstrip("/") in self._tuis()
+
+    def tty_de(self, sid):
+        """tty de la terminal de una sesión de Codex, si hay exactamente un Codex en su carpeta."""
+        s = self.ses.get(sid)
+        if not s:
+            return None
+        ttys = self._tuis().get(s.get("cwd", "").rstrip("/"), set())
+        return next(iter(ttys)) if len(ttys) == 1 else None
 
     def lista(self):
         """Sesiones vivas con la misma forma que leer_registro()."""
         ahora = time.time()
         self._cargar_titulos()
+        for s in self.ses.values():   # sesiones guardadas antes de conocer su origen
+            if "plugin" not in s and s.get("pid"):
+                s["plugin"] = _de_plugin(s["pid"])
         muertas = [k for k, s in self.ses.items()
-                   if not self._viva(s) or ahora - s.get("cambio", 0) > CODEX_INACTIVA_MAX]
+                   if not self._viva(s) or ahora - s.get("cambio", 0) > CODEX_INACTIVA_MAX
+                   or (s.get("plugin") and s.get("estado") == "en_espera")]   # consulta mía ya terminada
         for k in muertas:
             self.ses.pop(k)
         if muertas:
@@ -504,12 +548,31 @@ class SesionesCodex:
                 "inicio": s.get("inicio", 0), "cambio_estado": s.get("cambio", 0),
                 "tokens": {"entrada": 0, "cache_escritura": 0, "cache_lectura": 0, "salida": 0},
                 "ultimo_hook": {"evento": s.get("evento", ""), "hace_seg": round(ahora - s.get("cambio", ahora))},
+                "tty_unico": not s.get("plugin") and self.tty_de(sid) is not None,   # acepta mensajes por voz
             }
             if s["estado"] == "permiso":
                 item["esperando_seg"] = round(ahora - s.get("desde", ahora))
                 item["permiso_mensaje"] = "permission to use " + s.get("herramienta", "")
             salida.append(item)
         return salida
+
+
+def _de_plugin(pid):
+    """El proceso viene del plugin de Codex de Claude (app-server-broker): es una consulta mía."""
+    for _ in range(6):
+        try:
+            r = subprocess.run(["/bin/ps", "-o", "ppid=,command=", "-p", str(pid)], capture_output=True, text=True, timeout=3)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        partes = r.stdout.strip().split(None, 1)
+        if len(partes) < 2:
+            return False
+        if "app-server-broker" in partes[1] or "/.claude/plugins/" in partes[1]:
+            return True
+        pid = int(partes[0])
+        if pid <= 1:
+            return False
+    return False
 
 
 def _es_interactiva(sid):
@@ -632,7 +695,7 @@ def resumen_placa(estado):
              "min": round((time.time() - s["inicio"]) / 60) if s["inicio"] else 0,
              "a": "x" if s.get("agente") == "codex" else "c",   # c = Claude, x = Codex
              "k": hashlib.sha256(str(s["id"]).encode()).hexdigest()[:10],   # id estable (los nombres se repiten)
-             "i": s["id"] if s.get("agente") != "codex" and s.get("origen") == "cli" else "",   # acepta mensajes por voz
+             "i": s["id"] if (s.get("agente") != "codex" and s.get("origen") == "cli") or s.get("tty_unico") else "",   # acepta mensajes por voz
              "q": s.get("espera_id", ""),                       # permiso contestable desde la placa
              "r": s.get("espera_resumen", "")[:140]}
             for s in _seis_estables(estado["sesiones"])
@@ -879,6 +942,14 @@ class Manejador(BaseHTTPRequestHandler):
         with lock:
             estado = json.loads(cache_estado["json"])
         for s in estado.get("sesiones", []):
+            if s.get("id") == sid and s.get("agente") == "codex":
+                if s.get("estado") in ("permiso", "respuesta"):
+                    raise RuntimeError("primero contesta el permiso de esa sesión")
+                with lock:
+                    tty = codex.tty_de(sid)
+                if not tty:
+                    raise RuntimeError("no encontré la terminal de ese Codex (¿dos en la misma carpeta?)")
+                return tty, s.get("nombre") or s.get("proyecto") or "Codex", "codex"
             if s.get("id") == sid and s.get("agente") != "codex":
                 if s.get("origen") != "cli":
                     raise RuntimeError("esa sesión no corre en una terminal")
@@ -893,7 +964,7 @@ class Manejador(BaseHTTPRequestHandler):
                 tty = r.stdout.strip()
                 if not tty or tty == "??":
                     raise RuntimeError("la sesión no tiene terminal")
-                return "/dev/" + tty, s.get("nombre") or s.get("proyecto") or "sesión"
+                return "/dev/" + tty, s.get("nombre") or s.get("proyecto") or "sesión", "claude"
         raise RuntimeError("la sesión ya no está abierta")
 
     def _verificar_destino(self, p):
@@ -907,11 +978,15 @@ class Manejador(BaseHTTPRequestHandler):
             raise RuntimeError("la sesión ya no está abierta")
         if s.get("estado") in ("permiso", "respuesta"):
             raise RuntimeError("primero contesta el permiso o la pregunta de esa sesión")
-        try:
-            r = subprocess.run(["/bin/ps", "-o", "tty=", "-p", str(int(s["pid"]))], capture_output=True, text=True, timeout=3)
-            tty_actual = "/dev/" + r.stdout.strip()
-        except (OSError, subprocess.SubprocessError, ValueError):
-            tty_actual = ""
+        if p.get("agente") == "codex":
+            with lock:
+                tty_actual = codex.tty_de(p["sid"]) or ""
+        else:
+            try:
+                r = subprocess.run(["/bin/ps", "-o", "tty=", "-p", str(int(s["pid"]))], capture_output=True, text=True, timeout=3)
+                tty_actual = "/dev/" + r.stdout.strip()
+            except (OSError, subprocess.SubprocessError, ValueError):
+                tty_actual = ""
         if tty_actual != p.get("tty"):
             raise RuntimeError("la terminal de esa sesión cambió; vuelve a dictar")
         if p.get("sostener") and s.get("estado") != "en_espera":
@@ -934,8 +1009,8 @@ class Manejador(BaseHTTPRequestHandler):
                     TRANSCRIBIENDO.release()
                 destino = parse_qs(urlparse(self.path).query).get("s", [""])[0]
                 if destino:                        # mensaje para una sesión abierta en Terminal
-                    tty, nombre = self._destino(destino)
-                    return self._json(200, voz.preparar_mensaje(texto, tty, nombre, destino))
+                    tty, nombre, agente = self._destino(destino)
+                    return self._json(200, voz.preparar_mensaje(texto, tty, nombre, destino, agente))
                 return self._json(200, voz.preparar(texto))
             datos = json.loads(cuerpo or b"{}")
             if ruta == "/api/voz/confirmar":       # placa: confirma la sesión pendiente

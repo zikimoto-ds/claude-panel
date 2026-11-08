@@ -6,6 +6,7 @@ Panel físico para una **Waveshare ESP32-S3-Touch-AMOLED-1.75C** (pantalla redon
 - Aviso y pitido cuando una sesión pide permiso; **aprobar o rechazar desde la placa** (firma HMAC, una sola vez por permiso).
 - Anillo con el consumo del bloque de 5 h y porcentaje semanal.
 - Crear sesiones por voz: botón BOOT → whisper.cpp local en la Mac → confirmar en la pantalla → se abre Terminal con `claude`.
+- Mensajes y comandos por voz a una sesión abierta en la app Terminal (Claude: `/compact`, `/clear`, `/exit`; Codex: `/quit`).
 - Funciona en la red local o por un túnel (streaming, pensado para el plan gratis de ngrok).
 
 ## Piezas
