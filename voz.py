@@ -138,13 +138,69 @@ def preparar(texto):
     return {"id": ident, "texto": instruccion[:400], "carpeta": _ruta_corta(carpeta)}
 
 
+def preparar_mensaje(texto, tty, nombre):
+    """Mensaje pendiente de confirmar para una sesión que ya está abierta en Terminal."""
+    texto = _una_linea(texto)
+    if not texto:
+        raise RuntimeError("mensaje vacío")
+    ident = uuid.uuid4().hex[:12]
+    with _lock:
+        _pendientes[ident] = {"tipo": "mensaje", "texto": texto, "tty": tty, "destino": nombre, "ts": time.time()}
+    return {"id": ident, "texto": texto[:400], "carpeta": "", "destino": nombre[:60]}
+
+
 def confirmar(ident):
     with _lock:
         p = _pendientes.pop(ident, None)
     if not p or time.time() - p["ts"] > VIGENCIA_PENDIENTE:
         raise RuntimeError("la petición venció o no existe")
+    if p.get("tipo") == "mensaje":
+        enviar_a_terminal(p["tty"], p["texto"])
+        return {"ok": True, "destino": p["destino"][:60]}
     lanzar(p["texto"], p["carpeta"])
     return {"ok": True, "carpeta": _ruta_corta(p["carpeta"])}
+
+
+def _una_linea(texto):
+    """Una sola línea sin caracteres de control (un salto de línea mandaría el mensaje a medias)."""
+    limpio = "".join(c if c.isprintable() else " " for c in str(texto))
+    return " ".join(limpio.split())[:2000]
+
+
+# Escribe en la pestaña de Terminal cuya tty coincide y que tiene un proceso corriendo, como si se
+# tecleara (+ Enter). Texto y tty van como argumentos de osascript: no se interpolan en el script.
+_SCRIPT_TERMINAL = """
+on run argv
+  set objetivo to item 1 of argv
+  set texto to item 2 of argv
+  tell application "Terminal"
+    repeat with w in windows
+      repeat with t in tabs of w
+        if (tty of t is objetivo) and (busy of t) then
+          do script texto in t
+          return "ok"
+        end if
+      end repeat
+    end repeat
+  end tell
+  return "no"
+end run
+"""
+
+
+def enviar_a_terminal(tty, texto):
+    texto = _una_linea(texto)
+    if not re.fullmatch(r"/dev/ttys\d+", tty or ""):
+        raise RuntimeError("terminal no válida")
+    r = subprocess.run(["/usr/bin/osascript", "-e", _SCRIPT_TERMINAL, tty, texto],
+                       capture_output=True, text=True, timeout=10)
+    if r.returncode != 0:
+        if "-1743" in r.stderr:
+            raise RuntimeError("macOS no dio permiso para controlar Terminal (Privacidad > Automatización)")
+        raise RuntimeError("osascript falló: " + r.stderr.strip()[-120:])
+    if r.stdout.strip() != "ok":
+        raise RuntimeError("la sesión no está en la app Terminal")
+    print(f"voz: mensaje enviado a {tty}", flush=True)
 
 
 # ------------------------------------------------------------- lanzar ----

@@ -609,6 +609,7 @@ def resumen_placa(estado):
              "og": s["origen"][:10],
              "min": round((time.time() - s["inicio"]) / 60) if s["inicio"] else 0,
              "a": "x" if s.get("agente") == "codex" else "c",   # c = Claude, x = Codex
+             "i": s["id"] if s.get("agente") != "codex" and s.get("origen") == "cli" else "",   # acepta mensajes por voz
              "q": s.get("espera_id", ""),                       # permiso contestable desde la placa
              "r": s.get("espera_resumen", "")[:140]}
             for s in _seis_estables(estado["sesiones"])
@@ -718,7 +719,7 @@ class Manejador(BaseHTTPRequestHandler):
         ts = self.headers.get("X-Panel-Ts", "")
         if not (TOKEN and firma and ts.isdigit()) or abs(time.time() - int(ts)) > 120:
             return False
-        ruta = urlparse(self.path).path
+        ruta = self.path   # ruta con query: la sesión destino (?s=) también queda firmada
         mensaje = f"{self.command} {ruta} {ts}"
         if cuerpo is not None:
             mensaje += " " + hashlib.sha256(cuerpo).hexdigest()
@@ -843,6 +844,28 @@ class Manejador(BaseHTTPRequestHandler):
     def _json(self, codigo, datos):
         self._enviar(codigo, json.dumps(datos, ensure_ascii=False).encode())
 
+    def _destino(self, sid):
+        """tty y nombre de una sesión de Claude Code abierta en la CLI (para escribirle por voz)."""
+        with lock:
+            estado = json.loads(cache_estado["json"])
+        for s in estado.get("sesiones", []):
+            if s.get("id") == sid and s.get("agente") != "codex":
+                if s.get("origen") != "cli":
+                    raise RuntimeError("esa sesión no corre en una terminal")
+                if s.get("estado") in ("permiso", "respuesta"):
+                    # lo tecleado caería en el diálogo de permiso o en las opciones de la pregunta
+                    raise RuntimeError("primero contesta el permiso o la pregunta de esa sesión")
+                try:
+                    r = subprocess.run(["/bin/ps", "-o", "tty=", "-p", str(int(s["pid"]))],
+                                       capture_output=True, text=True, timeout=3)
+                except (OSError, subprocess.SubprocessError, ValueError):
+                    raise RuntimeError("no se pudo ubicar la terminal")
+                tty = r.stdout.strip()
+                if not tty or tty == "??":
+                    raise RuntimeError("la sesión no tiene terminal")
+                return "/dev/" + tty, s.get("nombre") or s.get("proyecto") or "sesión"
+        raise RuntimeError("la sesión ya no está abierta")
+
     def _post_voz(self, ruta):
         try:
             cuerpo = self._leer_cuerpo(2_000_000)   # ~60 s de audio a 16 kHz mono
@@ -852,6 +875,10 @@ class Manejador(BaseHTTPRequestHandler):
             return self._json(401, {"error": "firma"})
         try:
             if ruta == "/api/voz":                 # placa: audio PCM -> texto pendiente de confirmar
+                destino = parse_qs(urlparse(self.path).query).get("s", [""])[0]
+                if destino:                        # mensaje para una sesión abierta en Terminal
+                    tty, nombre = self._destino(destino)
+                    return self._json(200, voz.preparar_mensaje(voz.transcribir(cuerpo), tty, nombre))
                 return self._json(200, voz.preparar(voz.transcribir(cuerpo)))
             datos = json.loads(cuerpo or b"{}")
             if ruta == "/api/voz/confirmar":       # placa: confirma la sesión pendiente

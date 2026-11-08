@@ -62,6 +62,7 @@ const uint16_t C_PERMISO = 0xFE8C;    // #FFD166
 struct Sesion {
   String nombre, proyecto, herramienta, origen;
   String espera, resumen;  // permiso contestable: id y comando/archivo (vacío por el túnel)
+  String sid;              // id de la sesión si acepta mensajes por voz (Claude en Terminal)
   char estado;
   char agente;  // 'c' = Claude Code, 'x' = Codex
   long salida;
@@ -339,6 +340,7 @@ bool aplicar(JsonDocument &doc) {
     d.agente = a[0];
     d.espera = s["q"] | "";
     d.resumen = s["r"] | "";
+    d.sid = s["i"] | "";
   }
   estado.usem = doc["usem"] | 0L;
   estado.lsem = doc["lsem"] | 0L;
@@ -732,7 +734,7 @@ void dibujarDetalle(const Sesion &s) {
   lienzo->setFont(u8g2_font_helvR12_tf);
   if (s.agente != 'x') centrado("Salida: " + abreviar(s.salida) + " tokens", 350, C_TENUE);
   lienzo->setFont(u8g2_font_helvR08_tf);
-  centrado("toca para volver", 392, C_GRIS);
+  centrado(s.sid.length() ? "BOOT: mensaje por voz  ·  toca para volver" : "toca para volver", 392, C_GRIS);
 }
 
 // ------------------------------------------------------------ vistas ----
@@ -740,7 +742,8 @@ enum Vista { PRINCIPAL, TOKENS, DETALLE, GRABANDO, PROCESANDO, CONFIRMAR, AVISO 
 Vista vista = PRINCIPAL;
 String procesandoTxt = "Transcribiendo...", procesandoSub = "whisper en tu Mac";
 // Voz (definido más abajo)
-struct Pendiente { String id, texto, carpeta; } pendiente;
+struct Pendiente { String id, texto, carpeta, destino; } pendiente;
+String destinoSid, destinoNombre;   // grabación dirigida a una sesión abierta (vacío = sesión nueva)
 String avisoTxt;
 uint16_t avisoColor = 0;
 uint32_t avisoDesde = 0, confirmarDesde = 0;
@@ -875,7 +878,22 @@ void leerBoton() {
   if (estable) return;                                         // solo el flanco de bajada
   ultimoToque = millis();
   if (vista == GRABANDO) terminarGrabacion();
-  else if (vista == PRINCIPAL || vista == TOKENS || vista == DETALLE || vista == AVISO) iniciarGrabacion();
+  else if (vista == DETALLE) {
+    int iDet = buscarDetalle();
+    if (iDet >= 0 && (estado.ses[iDet].estado == 'P' || estado.ses[iDet].estado == 'R')) {
+      mostrarAviso("Primero contesta el permiso o la pregunta de esta sesión", C_AMBAR);
+    } else if (iDet >= 0 && estado.ses[iDet].sid.length()) {
+      destinoSid = estado.ses[iDet].sid;
+      destinoNombre = estado.ses[iDet].nombre;
+      iniciarGrabacion();
+    } else {
+      mostrarAviso("Esta sesión no recibe mensajes por voz: solo las de Claude en la app Terminal", C_AMBAR);
+    }
+  } else if (vista == PRINCIPAL || vista == TOKENS || vista == AVISO) {
+    destinoSid = "";
+    destinoNombre = "";
+    iniciarGrabacion();
+  }
 }
 
 void leerTouch() {
@@ -1101,12 +1119,14 @@ void terminarGrabacion() {
   vista = PROCESANDO;
   dibujar(false);
   String resp;
-  int codigo = postFirmado("/api/voz", (uint8_t *)grab, grabMuestras * sizeof(int16_t), "application/octet-stream", resp);
+  String rutaVoz = destinoSid.length() ? "/api/voz?s=" + destinoSid : String("/api/voz");
+  int codigo = postFirmado(rutaVoz.c_str(), (uint8_t *)grab, grabMuestras * sizeof(int16_t), "application/octet-stream", resp);
   JsonDocument d;
   if (codigo == 200 && !deserializeJson(d, resp)) {
     pendiente.id = d["id"] | "";
     pendiente.texto = d["texto"] | "";
     pendiente.carpeta = d["carpeta"] | "";
+    pendiente.destino = d["destino"] | "";
     confirmarDesde = millis();
     vista = CONFIRMAR;
   } else {
@@ -1129,14 +1149,14 @@ void decidirPermiso(const String &espera, char d) {
 }
 
 void lanzarPendiente() {
-  procesandoTxt = "Lanzando...";
+  procesandoTxt = pendiente.destino.length() ? "Enviando..." : "Lanzando...";
   procesandoSub = "";
   vista = PROCESANDO;
   dibujar(false);
   String cuerpo = "{\"id\":\"" + pendiente.id + "\"}";
   String resp;
   int codigo = postFirmado("/api/voz/confirmar", (const uint8_t *)cuerpo.c_str(), cuerpo.length(), "application/json", resp);
-  if (codigo == 200) mostrarAviso("Sesión lanzada en " + pendiente.carpeta, C_VERDE);
+  if (codigo == 200) mostrarAviso(pendiente.destino.length() ? "Enviado a " + pendiente.destino : "Sesión lanzada en " + pendiente.carpeta, C_VERDE);
   else mostrarAviso("No se lanzó: " + errorDe(codigo, resp), C_ROJO);
   pendiente = Pendiente();
 }
@@ -1150,13 +1170,15 @@ void dibujarGrabando() {
   centrado("Escuchando...", CY + 30, C_TINTA);
   lienzo->setFont(u8g2_font_helvR12_tf);
   centrado(String((int)seg) + " s de " + String(MAX_SEG_VOZ), CY + 58, C_TENUE);
-  centrado("pulsa BOOT para enviar", CY + 84, C_TENUE);
+  centrado("pulsa BOOT para terminar", CY + 84, C_TENUE);
+  if (destinoNombre.length()) centrado("mensaje para " + recortar(destinoNombre, 260), CY + 110, C_CLAUDE);
 }
 
 void dibujarConfirmar() {
   lienzo->fillArc(CX, CY, 224, 216, 0, 360, C_AZUL);
   lienzo->setFont(u8g2_font_helvR10_tf);
-  centrado("Nueva sesión en " + recortar(pendiente.carpeta, 240), 88, C_TENUE);
+  if (pendiente.destino.length()) centrado("Mensaje para " + recortar(pendiente.destino, 240), 88, C_CLAUDE);
+  else centrado("Nueva sesión en " + recortar(pendiente.carpeta, 240), 88, C_TENUE);
   lienzo->setFont(u8g2_font_helvB12_tf);
   String renglones[6];
   int n = envolver(pendiente.texto, 330, renglones, 6);
@@ -1169,8 +1191,9 @@ void dibujarConfirmar() {
   lienzo->setCursor(159 - anchoTexto("Cancelar") / 2, 360);
   lienzo->print("Cancelar");
   lienzo->setTextColor(C_TINTA);
-  lienzo->setCursor(307 - anchoTexto("Lanzar") / 2, 360);
-  lienzo->print("Lanzar");
+  const char *accion = pendiente.destino.length() ? "Enviar" : "Lanzar";
+  lienzo->setCursor(307 - anchoTexto(accion) / 2, 360);
+  lienzo->print(accion);
 }
 
 void dibujarAviso() {
